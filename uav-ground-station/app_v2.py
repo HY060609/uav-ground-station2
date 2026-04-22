@@ -35,11 +35,11 @@ def init_session_state():
     if 'end_point' not in st.session_state:
         st.session_state.end_point = {"lat": 32.2344, "lng": 118.749, "height": 0}
     if 'flight_height' not in st.session_state:
-        st.session_state.flight_height = 50  # 默认飞行高度50米
+        st.session_state.flight_height = 50
     if 'safety_radius' not in st.session_state:
-        st.session_state.safety_radius = 5  # 默认安全半径5米
+        st.session_state.safety_radius = 5
     if 'bypass_strategy' not in st.session_state:
-        st.session_state.bypass_strategy = "best"  # left, right, best
+        st.session_state.bypass_strategy = "best"
     if 'planned_route' not in st.session_state:
         st.session_state.planned_route = []
     if 'route_analysis' not in st.session_state:
@@ -47,13 +47,15 @@ def init_session_state():
     if 'map_center' not in st.session_state:
         st.session_state.map_center = [32.2333, 118.749]
     if 'setting_mode' not in st.session_state:
-        st.session_state.setting_mode = None  # 'start' or 'end'
+        st.session_state.setting_mode = None
     if 'deployment_status' not in st.session_state:
-        st.session_state.deployment_status = None  # 部署状态
+        st.session_state.deployment_status = None
     if 'deployment_log' not in st.session_state:
-        st.session_state.deployment_log = []  # 部署日志
+        st.session_state.deployment_log = []
     if 'obstacles_loaded' not in st.session_state:
-        st.session_state.obstacles_loaded = False  # 标记是否已自动加载
+        st.session_state.obstacles_loaded = False
+    if 'map_key' not in st.session_state:
+        st.session_state.map_key = 0  # 用于强制刷新地图
 
 init_session_state()
 
@@ -122,7 +124,7 @@ def wgs84_to_gcj02(lat, lng):
 # ==================== 地理计算工具函数 ====================
 def haversine_distance(lat1, lng1, lat2, lng2):
     """计算两点之间的距离（米）"""
-    R = 6371000  # 地球半径（米）
+    R = 6371000
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     delta_phi = math.radians(lat2 - lat1)
@@ -164,35 +166,25 @@ def get_point_at_distance(lat, lng, bearing, distance):
 
 # ==================== 障碍物与航线规划 ====================
 def get_obstacle_max_height(obstacle):
-    """获取障碍物的最大高度（默认10米，可配置）"""
     return obstacle.get("height", 10)
 
 def check_obstacle_intersection(start, end, obstacle_polygon, safety_radius):
-    """检查航线是否与障碍物相交"""
     line = LineString([(start[1], start[0]), (end[1], end[0])])
-    buffer = obstacle_polygon.buffer(safety_radius / 111000)  # 转换为度
+    buffer = obstacle_polygon.buffer(safety_radius / 111000)
     return line.intersects(buffer)
 
 def calculate_bypass_points(start, end, obstacle_polygon, direction, safety_radius):
-    """计算绕行航点"""
-    # 获取障碍物边界
     bounds = obstacle_polygon.bounds
     center = obstacle_polygon.centroid
-    
-    # 计算绕行偏移量
     offset = safety_radius / 111000
     
     if direction == "left":
-        # 向左绕行
         bypass1 = (center.y - offset, bounds[0] - offset)
         bypass2 = (center.y - offset, bounds[2] + offset)
     elif direction == "right":
-        # 向右绕行
         bypass1 = (center.y + offset, bounds[0] - offset)
         bypass2 = (center.y + offset, bounds[2] + offset)
     else:
-        # 最佳航线（最短路径）
-        # 找到障碍物上距离航线最近的点
         line = LineString([(start[1], start[0]), (end[1], end[0])])
         nearest = nearest_points(line, obstacle_polygon)[1]
         bypass1 = (nearest.y + offset, nearest.x)
@@ -215,10 +207,9 @@ def plan_route():
         "fly_over_count": 0
     }
     
-    # 构建障碍物多边形列表
     obstacle_polygons = []
     for obs in st.session_state.obstacles:
-        points = [(p[1], p[0]) for p in obs["points"]]  # (lng, lat) for shapely
+        points = [(p[1], p[0]) for p in obs["points"]]
         if len(points) >= 3:
             poly = Polygon(points)
             obstacle_polygons.append({
@@ -229,12 +220,10 @@ def plan_route():
     
     current_point = start
     
-    # 简化的航线规划：检查每个障碍物
     for obs_data in obstacle_polygons:
         poly = obs_data["polygon"]
         obs_height = obs_data["height"]
         
-        # 检查当前点到终点的线段是否与障碍物相交
         line = LineString([(current_point[1], current_point[0]), (end[1], end[0])])
         
         if line.intersects(poly.buffer(safety_radius / 111000)):
@@ -243,13 +232,10 @@ def plan_route():
                 "decision": ""
             })
             
-            # 决策：飞跃还是绕行
             if flight_height > obs_height + safety_radius:
-                # 直接飞跃
                 route_analysis["fly_over_count"] += 1
                 route_analysis["obstacles_encountered"][-1]["decision"] = "飞跃"
             else:
-                # 需要绕行
                 route_analysis["bypass_count"] += 1
                 strategy = st.session_state.bypass_strategy
                 
@@ -258,7 +244,6 @@ def plan_route():
                 elif strategy == "right":
                     bypass_points = calculate_bypass_points(current_point, end, poly, "right", safety_radius)
                 else:
-                    # 最佳航线：计算左右绕行距离，选择较短的
                     left_points = calculate_bypass_points(current_point, end, poly, "left", safety_radius)
                     right_points = calculate_bypass_points(current_point, end, poly, "right", safety_radius)
                     
@@ -278,16 +263,12 @@ def plan_route():
                         strategy = "right"
                 
                 route_analysis["obstacles_encountered"][-1]["decision"] = f"绕行({strategy})"
-                
-                # 添加绕行点
                 route_points.extend(bypass_points)
                 current_point = bypass_points[-1]
     
-    # 添加终点
     if route_points[-1] != end:
         route_points.append(end)
     
-    # 计算总距离
     total_distance = 0
     for i in range(len(route_points) - 1):
         total_distance += haversine_distance(
@@ -305,10 +286,6 @@ def plan_route():
 
 # ==================== 一键部署功能 ====================
 def deploy_route_to_uav():
-    """
-    将规划的航线指令部署到无人机
-    模拟生成MAVLink指令集并发送
-    """
     if not st.session_state.planned_route:
         return {
             "success": False,
@@ -319,11 +296,9 @@ def deploy_route_to_uav():
     route = st.session_state.planned_route
     analysis = st.session_state.route_analysis
     
-    # 生成部署指令集
     commands = []
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     
-    # 1. 起飞指令
     commands.append({
         "seq": len(commands) + 1,
         "command": "TAKEOFF",
@@ -332,9 +307,7 @@ def deploy_route_to_uav():
         "timestamp": timestamp
     })
     
-    # 2. 航点指令
     for i, point in enumerate(route):
-        # 添加高度信息到航点
         cmd = {
             "seq": len(commands) + 1,
             "command": "WAYPOINT",
@@ -347,7 +320,6 @@ def deploy_route_to_uav():
         }
         commands.append(cmd)
     
-    # 3. 降落指令
     commands.append({
         "seq": len(commands) + 1,
         "command": "LAND",
@@ -356,7 +328,6 @@ def deploy_route_to_uav():
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     })
     
-    # 生成部署报告
     deployment_report = {
         "success": True,
         "message": "✅ 航线指令已成功部署到无人机！",
@@ -371,7 +342,6 @@ def deploy_route_to_uav():
         "commands": commands
     }
     
-    # 保存部署状态和日志
     st.session_state.deployment_status = deployment_report
     st.session_state.deployment_log.append({
         "time": deployment_report["deploy_time"],
@@ -379,7 +349,6 @@ def deploy_route_to_uav():
         "distance": analysis.get("total_distance", 0)
     })
     
-    # 保留最近10条日志
     if len(st.session_state.deployment_log) > 10:
         st.session_state.deployment_log = st.session_state.deployment_log[-10:]
     
@@ -396,15 +365,13 @@ def heartbeat():
         "signal": random.randint(70, 99)
     }
 
-# ==================== 障碍物持久化（带自动记忆功能） ====================
+# ==================== 障碍物持久化 ====================
 OBSTACLE_FILE = "obstacle_config.json"
 
 def get_obstacle_file_path():
-    """获取障碍物配置文件的完整路径"""
     return os.path.abspath(OBSTACLE_FILE)
 
 def save_obstacles_to_file():
-    """保存障碍物到文件（自动触发）"""
     data = {
         "version": "v12.2",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -420,7 +387,6 @@ def save_obstacles_to_file():
         return False
 
 def load_obstacles_from_file():
-    """从文件加载障碍物"""
     if os.path.exists(OBSTACLE_FILE):
         try:
             with open(OBSTACLE_FILE, "r", encoding="utf-8") as f:
@@ -434,7 +400,6 @@ def load_obstacles_from_file():
     return False, 0, None
 
 def auto_load_obstacles():
-    """自动加载障碍物（启动时调用）"""
     if not st.session_state.obstacles_loaded:
         success, count, timestamp = load_obstacles_from_file()
         st.session_state.obstacles_loaded = True
@@ -443,7 +408,6 @@ def auto_load_obstacles():
     return False, 0, None
 
 def add_obstacle_from_draw(feature):
-    """从绘制的多边形添加障碍物（自动保存）"""
     try:
         if feature.get('geometry', {}).get('type') == 'Polygon':
             coords = feature['geometry']['coordinates'][0]
@@ -455,7 +419,6 @@ def add_obstacle_from_draw(feature):
             if len(points) > 1 and points[0] == points[-1]:
                 points = points[:-1]
             
-            # 添加障碍物高度（默认10米）
             obstacle_height = st.session_state.get("new_obstacle_height", 10)
             
             st.session_state.obstacles.append({
@@ -463,7 +426,6 @@ def add_obstacle_from_draw(feature):
                 "height": obstacle_height,
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
-            # 自动保存到文件
             save_obstacles_to_file()
             return True
     except Exception as e:
@@ -471,15 +433,13 @@ def add_obstacle_from_draw(feature):
     return False
 
 def remove_obstacle(index):
-    """删除障碍物（自动保存）"""
     if 0 <= index < len(st.session_state.obstacles):
         st.session_state.obstacles.pop(index)
-        save_obstacles_to_file()  # 自动保存
+        save_obstacles_to_file()
 
 def clear_all_obstacles():
-    """清空所有障碍物（自动保存）"""
     st.session_state.obstacles = []
-    save_obstacles_to_file()  # 自动保存
+    save_obstacles_to_file()
 
 # ==================== 地图创建 ====================
 def create_map():
@@ -506,7 +466,6 @@ def create_map():
         tiles='OpenStreetMap'
     )
     
-    # 添加卫星图层
     folium.TileLayer(
         tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
         attr='Esri',
@@ -520,7 +479,6 @@ def create_map():
     
     folium.LayerControl().add_to(m)
     
-    # 添加绘图工具
     draw = Draw(
         draw_options={
             'polygon': True,
@@ -585,7 +543,6 @@ def create_map():
             popup=f"障碍物 {idx + 1} | 高度: {obstacle_height}m"
         ).add_to(m)
         
-        # 添加高度标注
         center = [sum(p[0] for p in wgs_points) / len(wgs_points),
                   sum(p[1] for p in wgs_points) / len(wgs_points)]
         folium.map.Marker(
@@ -600,7 +557,6 @@ def create_map():
             wgs = gcj02_to_wgs84(point[0], point[1])
             route_wgs.append([wgs[0], wgs[1]])
         
-        # 航线
         folium.PolyLine(
             locations=route_wgs,
             color='purple',
@@ -609,7 +565,6 @@ def create_map():
             popup=f"规划航线 | 总距离: {st.session_state.route_analysis.get('total_distance', 0):.1f}m"
         ).add_to(m)
         
-        # 航点标记
         for i, point in enumerate(route_wgs[1:-1], 1):
             folium.CircleMarker(
                 location=point,
@@ -619,7 +574,7 @@ def create_map():
                 popup=f"航点 {i}"
             ).add_to(m)
     
-    # 原始直线航线（对比）
+    # 原始直线航线
     folium.PolyLine(
         locations=[[start_wgs[0], start_wgs[1]], [end_wgs[0], end_wgs[1]]],
         color='gray',
@@ -636,7 +591,7 @@ def main():
     st.title("✈️ 无人机智能化应用系统")
     st.caption("魏坤的《无人机智能化应用2451》 | 分组作业4-项目Demo | 智能航线规划系统")
     
-    # 自动加载上次保存的障碍物（记忆功能）
+    # 自动加载上次保存的障碍物
     loaded, count, timestamp = auto_load_obstacles()
     if loaded:
         st.success(f"💾 已自动加载 {count} 个障碍物（上次保存时间: {timestamp}）")
@@ -664,7 +619,7 @@ def main():
         st.subheader("🗺️ 地图显示 (OpenStreetMap)")
         
         # 设置模式按钮行
-        mode_col1, mode_col2, mode_col3 = st.columns(3)
+        mode_col1, mode_col2, mode_col3, mode_col4 = st.columns(4)
         with mode_col1:
             if st.button("📍 设置起点A", use_container_width=True):
                 st.session_state.setting_mode = "start"
@@ -676,6 +631,13 @@ def main():
         with mode_col3:
             if st.button("❌ 取消", use_container_width=True):
                 st.session_state.setting_mode = None
+        with mode_col4:
+            if st.button("🔄 重新规划", use_container_width=True):
+                # 手动重新规划航线
+                with st.spinner("正在重新规划航线..."):
+                    route_points, analysis = plan_route()
+                    st.success(f"✅ 航线已更新！总距离: {analysis['total_distance']:.1f}m")
+                    st.rerun()
         
         # 显示当前模式
         if st.session_state.setting_mode == "start":
@@ -683,42 +645,46 @@ def main():
         elif st.session_state.setting_mode == "end":
             st.info("🔴 当前模式：设置终点B - 请点击地图上的位置")
         
-        st.caption("📍 点击上方按钮，然后在地图上点击设置A/B点 | 使用【多边形】工具圈选障碍物 | 紫色线为规划航线")
+        st.caption("📍 点击上方按钮，然后在地图上点击设置A/B点 | 使用【多边形】工具圈选障碍物 | 紫色线为规划航线 | 改变A/B点后请点击【重新规划】")
         
         try:
+            # 使用 key 参数确保地图正确刷新
             m = create_map()
             output = st_folium(
                 m, 
                 width=800, 
                 height=500,
+                key=f"folium_map_{st.session_state.map_key}",  # 动态key强制刷新
                 returned_objects=["last_active_drawing", "last_clicked"]
             )
             
-            # 处理地图点击事件（设置A/B点）
+            # 处理地图点击事件
             if output and output.get("last_clicked"):
                 clicked = output["last_clicked"]
                 if clicked and "lat" in clicked and "lng" in clicked:
                     wgs_lat = clicked["lat"]
                     wgs_lng = clicked["lng"]
-                    # 转换为GCJ-02坐标存储
                     gcj_lat, gcj_lng = wgs84_to_gcj02(wgs_lat, wgs_lng)
                     
                     if st.session_state.setting_mode == "start":
                         st.session_state.start_point = {"lat": gcj_lat, "lng": gcj_lng, "height": st.session_state.start_point.get("height", 0)}
                         st.session_state.setting_mode = None
+                        st.session_state.map_key += 1  # 强制刷新地图
                         st.success(f"✅ 起点已设置: ({gcj_lat:.6f}, {gcj_lng:.6f})")
                         st.rerun()
                     elif st.session_state.setting_mode == "end":
                         st.session_state.end_point = {"lat": gcj_lat, "lng": gcj_lng, "height": st.session_state.end_point.get("height", 0)}
                         st.session_state.setting_mode = None
+                        st.session_state.map_key += 1  # 强制刷新地图
                         st.success(f"✅ 终点已设置: ({gcj_lat:.6f}, {gcj_lng:.6f})")
                         st.rerun()
             
-            # 处理绘制多边形（添加障碍物）
+            # 处理绘制多边形
             if output and output.get("last_active_drawing"):
                 feature = output["last_active_drawing"]
                 if feature.get("geometry", {}).get("type") == "Polygon":
                     if add_obstacle_from_draw(feature):
+                        st.session_state.map_key += 1  # 强制刷新地图
                         st.success("✅ 障碍物已添加并自动保存！")
                         st.rerun()
                         
@@ -729,6 +695,7 @@ def main():
         with st.expander("📖 地图操作说明"):
             st.markdown("""
             - **设置起点/终点**: 点击上方「设置起点A」或「设置终点B」按钮，然后在地图上点击位置
+            - **重新规划**: 改变A/B点后，点击「重新规划」按钮更新航线
             - **缩放**: 鼠标滚轮
             - **移动**: 拖拽地图
             - **圈选障碍物**: 点击地图左上角的【多边形】图标 ✏️
@@ -745,14 +712,16 @@ def main():
         with st.expander("📍 起点A 信息", expanded=True):
             col_lat, col_lng = st.columns(2)
             with col_lat:
-                start_lat = st.number_input("纬度", value=float(st.session_state.start_point["lat"]), format="%.6f", key="start_lat_manual")
-                if start_lat != st.session_state.start_point["lat"]:
-                    st.session_state.start_point["lat"] = start_lat
+                new_start_lat = st.number_input("纬度", value=float(st.session_state.start_point["lat"]), format="%.6f", key="start_lat_manual")
+                if new_start_lat != st.session_state.start_point["lat"]:
+                    st.session_state.start_point["lat"] = new_start_lat
+                    st.session_state.map_key += 1
                     st.rerun()
             with col_lng:
-                start_lng = st.number_input("经度", value=float(st.session_state.start_point["lng"]), format="%.6f", key="start_lng_manual")
-                if start_lng != st.session_state.start_point["lng"]:
-                    st.session_state.start_point["lng"] = start_lng
+                new_start_lng = st.number_input("经度", value=float(st.session_state.start_point["lng"]), format="%.6f", key="start_lng_manual")
+                if new_start_lng != st.session_state.start_point["lng"]:
+                    st.session_state.start_point["lng"] = new_start_lng
+                    st.session_state.map_key += 1
                     st.rerun()
             start_height = st.number_input("起点高度(m)", value=st.session_state.start_point.get("height", 0), step=1, key="start_height")
             if start_height != st.session_state.start_point.get("height", 0):
@@ -763,14 +732,16 @@ def main():
         with st.expander("🏁 终点B 信息", expanded=True):
             col_lat, col_lng = st.columns(2)
             with col_lat:
-                end_lat = st.number_input("纬度", value=float(st.session_state.end_point["lat"]), format="%.6f", key="end_lat_manual")
-                if end_lat != st.session_state.end_point["lat"]:
-                    st.session_state.end_point["lat"] = end_lat
+                new_end_lat = st.number_input("纬度", value=float(st.session_state.end_point["lat"]), format="%.6f", key="end_lat_manual")
+                if new_end_lat != st.session_state.end_point["lat"]:
+                    st.session_state.end_point["lat"] = new_end_lat
+                    st.session_state.map_key += 1
                     st.rerun()
             with col_lng:
-                end_lng = st.number_input("经度", value=float(st.session_state.end_point["lng"]), format="%.6f", key="end_lng_manual")
-                if end_lng != st.session_state.end_point["lng"]:
-                    st.session_state.end_point["lng"] = end_lng
+                new_end_lng = st.number_input("经度", value=float(st.session_state.end_point["lng"]), format="%.6f", key="end_lng_manual")
+                if new_end_lng != st.session_state.end_point["lng"]:
+                    st.session_state.end_point["lng"] = new_end_lng
+                    st.session_state.map_key += 1
                     st.rerun()
             end_height = st.number_input("终点高度(m)", value=st.session_state.end_point.get("height", 0), step=1, key="end_height")
             if end_height != st.session_state.end_point.get("height", 0):
@@ -847,7 +818,6 @@ def main():
             for i, obs in enumerate(analysis.get('obstacles_encountered', [])):
                 st.caption(f"障碍物 {i+1}: {obs['height']}m → {obs['decision']}")
             
-            # 显示航点信息
             if analysis.get('route_points'):
                 st.divider()
                 st.caption(f"📍 规划航点数: {len(analysis['route_points'])}")
@@ -856,14 +826,12 @@ def main():
         
         st.divider()
         
-        # ==================== 障碍物管理 ====================
+        # 障碍物管理
         st.subheader("⛔ 障碍物管理")
         
-        # 新障碍物高度预设
         st.caption("绘制新障碍物时预设高度:")
         new_obs_height = st.number_input("障碍物高度(m)", value=10, step=5, key="new_obstacle_height")
         
-        # 显示当前障碍物列表
         if st.session_state.obstacles:
             st.caption(f"共 {len(st.session_state.obstacles)} 个障碍物")
             for idx, obs in enumerate(st.session_state.obstacles):
@@ -871,6 +839,7 @@ def main():
                 with col_del:
                     if st.button("❌", key=f"del_{idx}"):
                         remove_obstacle(idx)
+                        st.session_state.map_key += 1
                         st.rerun()
                 with col_info:
                     obs_height = obs.get('height', 10)
@@ -881,7 +850,6 @@ def main():
         
         st.divider()
         
-        # 配置持久化按钮（保留但改为手动导出/导入）
         col_save, col_load, col_clear = st.columns(3)
         with col_save:
             if st.button("💾 手动保存", use_container_width=True):
@@ -894,12 +862,14 @@ def main():
                 success, count, timestamp = load_obstacles_from_file()
                 if success:
                     st.success(f"加载 {count} 个障碍物（{timestamp}）")
+                    st.session_state.map_key += 1
                     st.rerun()
                 else:
                     st.warning("无配置文件")
         with col_clear:
             if st.button("🗑️ 清空", use_container_width=True):
                 clear_all_obstacles()
+                st.session_state.map_key += 1
                 st.success("已清空并保存")
                 st.rerun()
         
@@ -907,10 +877,9 @@ def main():
         
         st.divider()
         
-        # ==================== 一键部署功能区 ====================
+        # 一键部署
         st.subheader("🚁 一键部署")
         
-        # 部署按钮
         if st.button("🚀 一键部署航线", type="primary", use_container_width=True):
             result = deploy_route_to_uav()
             if result["success"]:
@@ -919,7 +888,6 @@ def main():
             else:
                 st.error(result["message"])
         
-        # 显示部署状态
         if st.session_state.deployment_status:
             status = st.session_state.deployment_status
             if status.get("success"):
@@ -931,12 +899,10 @@ def main():
                     st.caption(f"🛡️ 安全半径: {status['safety_radius']}m")
                     st.caption(f"⛔ 障碍物数量: {status['obstacle_count']}")
                     
-                    # 显示指令序列
                     with st.expander("📡 查看指令序列"):
                         for cmd in status.get("commands", []):
                             st.code(f"[{cmd['seq']:2d}] {cmd['command']:10s} | {cmd['description']}", language="text")
         
-        # 部署历史
         if st.session_state.deployment_log:
             with st.expander("📜 部署历史"):
                 for log in st.session_state.deployment_log[-5:]:
@@ -945,6 +911,7 @@ def main():
         st.divider()
         
         if st.button("🔄 刷新地图", use_container_width=True):
+            st.session_state.map_key += 1
             st.rerun()
 
 if __name__ == "__main__":
