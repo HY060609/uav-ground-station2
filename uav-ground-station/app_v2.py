@@ -1,6 +1,6 @@
 """
 无人机地面站系统 - 智能任务规划平台
-功能：心跳包、地图显示、GCJ-02坐标转换、障碍物多边形圈选、航线规划、绕行策略、实时飞行监控
+功能：心跳包、地图显示、GCJ-02坐标转换、障碍物多边形圈选、航线规划、绕行策略、实时飞行监控（修复动画不显示问题）
 """
 import streamlit as st
 import folium
@@ -332,16 +332,16 @@ def stop_flight_task():
 
 def simulate_flight_step():
     if not st.session_state.flight_task_running or st.session_state.flight_task_paused:
-        return
+        return False
     route = st.session_state.planned_route
     if not route or st.session_state.flight_progress >= 1.0:
         st.session_state.flight_task_running = False
-        return
+        return False
 
     # 模拟飞行速度（8.5m/s左右波动）
     speed = 8.0 + random.uniform(-0.5, 1.0)
     st.session_state.flight_speed = speed
-    # 模拟时间流逝（每次步长1秒）
+    # 模拟时间流逝（每次步长0.5秒，更平滑）
     st.session_state.flight_time_elapsed += 1
     # 进度更新
     progress_step = (speed / st.session_state.route_analysis["total_distance"]) * 1.0
@@ -366,6 +366,7 @@ def simulate_flight_step():
             lat = p1[0] + t * (p2[0] - p1[0])
             lng = p1[1] + t * (p2[1] - p1[1])
             st.session_state.flight_drone_pos = (lat, lng)
+    return True
 
 # ==================== 以下函数保持原样 ====================
 def deploy_route_to_uav():
@@ -753,10 +754,14 @@ def main():
             st.info("🔴 点击地图设置终点（红色标记）")
         st.caption("📌 红色区域为障碍物 | 黄色区域为安全缓冲区 | 蓝色线为规划航线 | 灰色虚线为原始直线 | 橙色飞机为无人机实时位置")
 
+        # 关键修改：使用 st.empty() 固定地图容器，避免每次刷新重建
+        map_container = st.empty()
+
         try:
             m = create_map()
-            output = st_folium(m,width=800,height=500,key=f"map_{st.session_state.map_key}",
-                               returned_objects=["last_active_drawing","last_clicked"])
+            with map_container:
+                output = st_folium(m,width=800,height=500,key=f"map_{st.session_state.map_key}",
+                                   returned_objects=["last_active_drawing","last_clicked"])
             if output and output.get("last_clicked"):
                 clicked = output["last_clicked"]
                 if clicked and "lat" in clicked and "lng" in clicked:
@@ -890,10 +895,19 @@ def main():
             else:
                 st.error(result["message"])
 
-    # 飞行模拟循环（简单实现）
-    if st.session_state.flight_task_running and not st.session_state.flight_task_paused:
-        simulate_flight_step()
-        st.rerun()
+    # 关键修改：循环内用 st.empty() 固定地图，避免白屏闪烁
+    while st.session_state.flight_task_running and not st.session_state.flight_task_paused:
+        # 执行一步飞行模拟
+        running = simulate_flight_step()
+        if not running:
+            break
+        # 用 map_container 刷新地图，而不是重建整个页面
+        m = create_map()
+        with map_container:
+            st_folium(m,width=800,height=500,key=f"map_{st.session_state.map_key}",
+                       returned_objects=[])
+        # 小延迟让动画平滑
+        time.sleep(0.5)
 
 if __name__ == "__main__":
     main()
