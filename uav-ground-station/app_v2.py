@@ -1,6 +1,6 @@
 """
 无人机地面站系统 - 智能任务规划平台
-功能：心跳包、地图显示、GCJ-02坐标转换、障碍物多边形圈选、航线规划、绕行策略、实时飞行监控（手动步进模式）
+功能：心跳包、地图显示、GCJ-02坐标转换、障碍物多边形圈选、航线规划、绕行策略、实时飞行监控（自动连续飞行）
 """
 
 import streamlit as st
@@ -13,6 +13,7 @@ from datetime import datetime
 import random
 import math
 from shapely.geometry import Point, Polygon, LineString
+from streamlit_autorefresh import st_autorefresh  # 需要安装：pip install streamlit-autorefresh
 
 # ==================== 页面配置 ====================
 st.set_page_config(
@@ -55,9 +56,9 @@ def init_session_state():
         st.session_state.map_key = 0
     if 'new_obstacle_height' not in st.session_state:
         st.session_state.new_obstacle_height = 60
-    # 飞行监控相关状态（手动步进模式）
-    if 'flight_task_active' not in st.session_state:
-        st.session_state.flight_task_active = False      # 任务是否已启动（准备状态）
+    # 飞行监控相关状态（自动飞行模式）
+    if 'auto_flight_enabled' not in st.session_state:
+        st.session_state.auto_flight_enabled = False    # 是否允许自动前进
     if 'flight_progress' not in st.session_state:
         st.session_state.flight_progress = 0.0
     if 'current_waypoint_idx' not in st.session_state:
@@ -71,7 +72,7 @@ def init_session_state():
     if 'flight_time_elapsed' not in st.session_state:
         st.session_state.flight_time_elapsed = 0
     if 'flight_speed' not in st.session_state:
-        st.session_state.flight_speed = 8.0   # 固定模拟速度 m/s
+        st.session_state.flight_speed = 8.0   # 模拟速度 m/s
 
 init_session_state()
 
@@ -301,41 +302,27 @@ def plan_route():
     st.session_state.map_key += 1
     return route, route_analysis
 
-# ==================== 飞行监控（手动步进模式） ====================
-def reset_flight_task():
-    st.session_state.flight_task_active = False
+# ==================== 自动飞行控制 ====================
+def reset_flight():
+    """重置飞行进度"""
+    st.session_state.auto_flight_enabled = False
     st.session_state.flight_progress = 0.0
     st.session_state.current_waypoint_idx = 0
     st.session_state.flight_remaining_dist = st.session_state.route_analysis.get("total_distance", 0)
     st.session_state.flight_battery = 100
     st.session_state.flight_drone_pos = st.session_state.planned_route[0] if st.session_state.planned_route else None
     st.session_state.flight_time_elapsed = 0
-    st.session_state.flight_speed = 8.0
 
-def start_flight_task():
-    if not st.session_state.planned_route:
-        st.error("请先规划航线！")
-        return
-    reset_flight_task()
-    st.session_state.flight_task_active = True
-    st.session_state.flight_drone_pos = st.session_state.planned_route[0]
-    st.session_state.flight_remaining_dist = st.session_state.route_analysis["total_distance"]
-
-def step_flight():
-    """单步前进：按固定距离移动一段（避免复杂插值，直接跳到下个航点）"""
-    if not st.session_state.flight_task_active:
-        st.warning("任务未启动，请先点击「开始任务」")
-        return
+def step_forward():
+    """前进一个航点（由自动刷新驱动）"""
     route = st.session_state.planned_route
     if not route:
         return
-    # 如果已经完成则不再移动
     if st.session_state.current_waypoint_idx >= len(route) - 1:
-        st.success("已到达终点！")
-        st.session_state.flight_task_active = False
+        # 已到达终点，停止自动飞行
+        st.session_state.auto_flight_enabled = False
         return
 
-    # 移动到下一个航点（简单步进）
     st.session_state.current_waypoint_idx += 1
     # 更新进度
     st.session_state.flight_progress = st.session_state.current_waypoint_idx / (len(route) - 1)
@@ -346,57 +333,48 @@ def step_flight():
     for i in range(st.session_state.current_waypoint_idx, len(route)-1):
         remaining += haversine_distance(route[i][0], route[i][1], route[i+1][0], route[i+1][1])
     st.session_state.flight_remaining_dist = remaining
-    # 更新模拟时间（基于固定速度）
+    # 更新时间
     total_dist = st.session_state.route_analysis["total_distance"]
     if total_dist > 0:
         st.session_state.flight_time_elapsed = int((st.session_state.flight_progress * total_dist) / st.session_state.flight_speed)
-    # 更新电量（简单随进度下降）
+    # 更新电量
     st.session_state.flight_battery = max(0, 100 - st.session_state.flight_progress * 5)
-    # 刷新地图
-    st.session_state.map_key += 1
-
-def complete_flight():
-    """自动完成：直接跳到最后，无中间动画"""
-    if not st.session_state.flight_task_active:
-        st.warning("任务未启动，请先点击「开始任务」")
-        return
-    route = st.session_state.planned_route
-    if not route:
-        return
-    st.session_state.current_waypoint_idx = len(route) - 1
-    st.session_state.flight_progress = 1.0
-    st.session_state.flight_drone_pos = route[-1]
-    st.session_state.flight_remaining_dist = 0
-    st.session_state.flight_time_elapsed = int(st.session_state.route_analysis["total_distance"] / st.session_state.flight_speed)
-    st.session_state.flight_battery = 95
-    st.session_state.flight_task_active = False
-    st.session_state.map_key += 1
 
 def render_flight_monitor():
-    st.markdown("### ✈️ 飞行实时画面 - 任务执行监控（手动步进模式）")
-    
-    # 控制按钮
-    col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4, col_ctrl5 = st.columns([1,1,1,1,1])
-    with col_ctrl1:
-        if st.button("▶ 开始任务", type="primary", use_container_width=True, disabled=st.session_state.flight_task_active):
-            start_flight_task()
-    with col_ctrl2:
-        if st.button("⏩ 单步前进", use_container_width=True, disabled=not st.session_state.flight_task_active):
-            step_flight()
-            st.rerun()   # 只rerun一次，用户可控
-    with col_ctrl3:
-        if st.button("⏹️ 自动完成", use_container_width=True, disabled=not st.session_state.flight_task_active):
-            complete_flight()
-            st.rerun()
-    with col_ctrl4:
-        if st.button("🔄 重置", use_container_width=True):
-            reset_flight_task()
-            st.rerun()
-    with col_ctrl5:
-        status = "就绪" if not st.session_state.flight_task_active else "任务进行中"
-        st.markdown(f"<div style='padding:8px; background-color:#f0f0f0; border-radius:4px; text-align:center;'>状态: {status}</div>", unsafe_allow_html=True)
+    st.markdown("### ✈️ 飞行实时画面 - 自动连续飞行")
 
-    # 飞行状态指标
+    # 控制按钮
+    col1, col2, col3 = st.columns([1,1,1])
+    with col1:
+        if st.button("▶ 开始自动飞行", type="primary", use_container_width=True, disabled=st.session_state.auto_flight_enabled):
+            if not st.session_state.planned_route:
+                st.error("请先规划航线！")
+            else:
+                reset_flight()
+                st.session_state.auto_flight_enabled = True
+                st.rerun()
+    with col2:
+        if st.button("⏹️ 停止飞行", use_container_width=True, disabled=not st.session_state.auto_flight_enabled):
+            st.session_state.auto_flight_enabled = False
+            st.rerun()
+    with col3:
+        if st.button("🔄 重置", use_container_width=True):
+            reset_flight()
+            st.rerun()
+
+    # 自动飞行逻辑：如果启用且未完成，则每300ms自动前进一个航点
+    if st.session_state.auto_flight_enabled:
+        route = st.session_state.planned_route
+        if route and st.session_state.current_waypoint_idx < len(route) - 1:
+            step_forward()
+            # 使用 st_autorefresh 实现自动重绘（300ms后重新执行脚本）
+            st_autorefresh(interval=300, key="auto_flight_refresh")
+        else:
+            # 飞行完成，自动关闭飞行标志
+            st.session_state.auto_flight_enabled = False
+            st.success("✅ 已到达终点！")
+
+    # 显示飞行状态指标
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     total_wp = len(st.session_state.planned_route) if st.session_state.planned_route else 0
     current_wp = st.session_state.current_waypoint_idx + 1
@@ -418,7 +396,7 @@ def render_flight_monitor():
 
     st.progress(st.session_state.flight_progress, text=f"任务进度: {st.session_state.flight_progress*100:.1f}%")
 
-    # 通信链路拓扑（保持原样）
+    # 通信链路拓扑（保持不变）
     st.markdown("---")
     st.markdown("#### 📡 通信链路拓扑与数据流")
     col_status1, col_status2, col_status3 = st.columns(3)
@@ -665,13 +643,15 @@ def main():
 - **设置起点/终点**: 点击对应按钮，再点击地图上的位置
 - **绘制障碍物**: 点击左上角多边形图标，画完后双击完成
 - **规划航线**: 点击「规划航线」按钮
-- **飞行任务**: 规划航线后点击「开始任务」，然后使用「单步前进」逐点移动，或「自动完成」直接结束
+- **自动飞行**: 点击「开始自动飞行」，飞机会自动沿航线逐点移动（每0.3秒前进一个航点），直到终点
+- **停止飞行**: 点击「停止飞行」可随时暂停，点击「重置」可重新开始
+
 **视觉说明**
 - 🔴 红色区域: 障碍物本体
 - 🟡 黄色区域: 安全缓冲区
 - 🔵 蓝色粗线: 规划航线
 - ⚪ 灰色虚线: 原始直线
-- 🟠 橙色飞机: 无人机实时位置（每步更新）
+- 🟠 橙色飞机: 无人机实时位置
 """)
 
     with mid_col:
