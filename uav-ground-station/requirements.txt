@@ -1,6 +1,6 @@
-streamlit
-folium
-streamlit-folium
-shapely
-numpy
-streamlit-autorefresh
+streamlit==1.35.0
+folium==0.15.1
+streamlit-folium==0.21.0
+shapely==2.0.4
+numpy==1.26.4
+streamlit-autorefresh==0.3.0
