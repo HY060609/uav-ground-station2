@@ -1,5 +1,5 @@
 """
-无人机地面站系统 - 手动规划模式（流畅版 + 修复地图索引错误）
+无人机地面站系统 - 手动规划模式（流畅版 + 修复函数定义顺序）
 - 初始：A(32.2323,118.749), B(32.2344,118.749)
 - AB点修改需要点击“应用更改”按钮，避免卡顿
 - 绕行算法：Visibility Graph + 面积检测
@@ -17,51 +17,7 @@ from shapely.ops import unary_union
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机地面站系统", layout="wide", page_icon="✈️")
 
-# ==================== 默认坐标（固定） ====================
-DEFAULT_A = {"lat": 32.2323, "lng": 118.7490, "height": 0}
-DEFAULT_B = {"lat": 32.2344, "lng": 118.7490, "height": 0}
-DEFAULT_FH = 10
-DEFAULT_SR = 8
-
-# ==================== Session State ====================
-def init_session_state():
-    if "inited" in st.session_state:
-        return
-    st.session_state.inited = True
-    st.session_state.heartbeat_count = 0
-    # 加载障碍物时进行过滤，确保 points 有效
-    raw_obs = _obs_load_raw()
-    st.session_state.obstacles = [o for o in raw_obs if o.get("points") and len(o["points"]) >= 3]
-    st.session_state.start_point = DEFAULT_A.copy()
-    st.session_state.end_point = DEFAULT_B.copy()
-    st.session_state.flight_height = DEFAULT_FH
-    st.session_state.safety_radius = DEFAULT_SR
-    st.session_state.bypass_strategy = "best"
-    st.session_state.planned_route = []
-    st.session_state.route_analysis = {}
-    st.session_state.setting_mode = None
-    st.session_state.map_key = 0
-    st.session_state.new_obstacle_height = 60
-    # 飞行监控
-    st.session_state.auto_flight_enabled = False
-    st.session_state.flight_paused = False
-    st.session_state.flight_progress = 0.0
-    st.session_state.current_waypoint_idx = 0
-    st.session_state.flight_remaining_dist = 0.0
-    st.session_state.flight_battery = 100
-    st.session_state.flight_drone_pos = None
-    st.session_state.flight_time_elapsed = 0
-    st.session_state.flight_speed = 8.0
-    st.session_state.comm_logs = []
-    st.session_state.link_delay = 25
-    st.session_state.link_loss = 0.1
-    st.session_state.mission_started = False
-    # 持久化文件（可选）
-    st.session_state.obstacles_loaded = True
-
-init_session_state()
-
-# ==================== 文件持久化（保存/加载障碍物） ====================
+# ==================== 文件持久化（放在最前面，供 init 使用） ====================
 OBSTACLE_FILE = "obstacle_config.json"
 WP_FILE = "waypoints.json"
 
@@ -109,6 +65,49 @@ def save_wp():
             }, f, ensure_ascii=False, indent=2)
     except:
         pass
+
+# ==================== 默认坐标（固定） ====================
+DEFAULT_A = {"lat": 32.2323, "lng": 118.7490, "height": 0}
+DEFAULT_B = {"lat": 32.2344, "lng": 118.7490, "height": 0}
+DEFAULT_FH = 10
+DEFAULT_SR = 8
+
+# ==================== Session State ====================
+def init_session_state():
+    if "inited" in st.session_state:
+        return
+    st.session_state.inited = True
+    st.session_state.heartbeat_count = 0
+    # 加载障碍物时进行过滤，确保 points 有效
+    raw_obs = _obs_load_raw()
+    st.session_state.obstacles = [o for o in raw_obs if o.get("points") and len(o["points"]) >= 3]
+    st.session_state.start_point = DEFAULT_A.copy()
+    st.session_state.end_point = DEFAULT_B.copy()
+    st.session_state.flight_height = DEFAULT_FH
+    st.session_state.safety_radius = DEFAULT_SR
+    st.session_state.bypass_strategy = "best"
+    st.session_state.planned_route = []
+    st.session_state.route_analysis = {}
+    st.session_state.setting_mode = None
+    st.session_state.map_key = 0
+    st.session_state.new_obstacle_height = 60
+    # 飞行监控
+    st.session_state.auto_flight_enabled = False
+    st.session_state.flight_paused = False
+    st.session_state.flight_progress = 0.0
+    st.session_state.current_waypoint_idx = 0
+    st.session_state.flight_remaining_dist = 0.0
+    st.session_state.flight_battery = 100
+    st.session_state.flight_drone_pos = None
+    st.session_state.flight_time_elapsed = 0
+    st.session_state.flight_speed = 8.0
+    st.session_state.comm_logs = []
+    st.session_state.link_delay = 25
+    st.session_state.link_loss = 0.1
+    st.session_state.mission_started = False
+    st.session_state.obstacles_loaded = True
+
+init_session_state()
 
 # ==================== GCJ-02 <-> WGS-84 ====================
 _AE = 6378245.0
