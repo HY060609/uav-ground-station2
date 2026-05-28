@@ -1,11 +1,11 @@
 """
-无人机地面站系统 - v8 (修复起终点持久化)
-核心改进：使用文件存储起终点，避免 Streamlit Cloud 中 query_params 不稳定
-- 左绕：只用障碍物缓冲区左侧顶点（相对起终点方向）构建可见性图
+无人机地面站系统 - v8 (修复起终点持久化 - 文件存储版)
+核心改进：
+- 放弃不稳定的 st.query_params，改用文件存储起终点和飞行参数
+- 左绕：只用障碍物缓冲区左侧顶点构建可见性图
 - 右绕：只用右侧顶点
 - 最佳：左右都算，取路径最短的
-- 贴边走：顶点是真正的缓冲区边界点，路径紧贴安全边界
-- 起终点修改后保存到文件，刷新页面后保持不变
+- 贴边走：路径紧贴安全缓冲区边缘
 """
 
 import streamlit as st
@@ -20,10 +20,10 @@ from streamlit_autorefresh import st_autorefresh
 
 # ==================== 文件持久化 ====================
 OBS_FILE = "obstacles.json"
-WP_FILE = "waypoints.json"      # 新增：保存起终点
+WP_FILE = "waypoints.json"      # 存储起终点和飞行参数
 
 def _wp_save():
-    """保存起终点到文件"""
+    """保存起终点和飞行参数到文件"""
     ss = st.session_state
     data = {
         "start_point": ss.start_point,
@@ -38,7 +38,7 @@ def _wp_save():
         pass
 
 def _wp_load():
-    """从文件加载起终点"""
+    """从文件加载起终点和飞行参数"""
     if os.path.exists(WP_FILE):
         try:
             with open(WP_FILE, "r", encoding="utf-8") as f:
@@ -63,23 +63,28 @@ def _obs_load():
             pass
     return []
 
-# ==================== Session State 初始化 ====================
+# ==================== 默认值 ====================
+DEFAULT_A  = {"lat": 32.232945, "lng": 118.746956, "height": 0}
+DEFAULT_B  = {"lat": 32.235204, "lng": 118.751589, "height": 0}
+DEFAULT_FH = 50
+DEFAULT_SR = 8
+
+# ==================== Session State ====================
 def init_session_state():
     if "inited" in st.session_state:
         return
-
-    # 加载保存的起终点
+    # 加载起终点和飞行参数
     wp_data = _wp_load()
     if wp_data:
-        start = wp_data.get("start_point", {"lat": 32.232945, "lng": 118.746956, "height": 0})
-        end   = wp_data.get("end_point",   {"lat": 32.235204, "lng": 118.751589, "height": 0})
-        fh    = wp_data.get("flight_height", 50)
-        sr    = wp_data.get("safety_radius", 8)
+        start = wp_data.get("start_point", DEFAULT_A.copy())
+        end   = wp_data.get("end_point",   DEFAULT_B.copy())
+        fh    = wp_data.get("flight_height", DEFAULT_FH)
+        sr    = wp_data.get("safety_radius", DEFAULT_SR)
     else:
-        start = {"lat": 32.232945, "lng": 118.746956, "height": 0}
-        end   = {"lat": 32.235204, "lng": 118.751589, "height": 0}
-        fh = 50
-        sr = 8
+        start = DEFAULT_A.copy()
+        end   = DEFAULT_B.copy()
+        fh    = DEFAULT_FH
+        sr    = DEFAULT_SR
 
     obs = _obs_load()
 
@@ -196,7 +201,7 @@ def seg_free(ax,ay,bx,by,union_geom,margin=0.15):
     p2=seg.interpolate(L-margin)
     return not LineString([p1,p2]).intersects(union_geom)
 
-# ==================== 核心：方向感知 Visibility Graph ====================
+# ==================== 方向感知 Visibility Graph ====================
 def _side_of_line(px,py,ax,ay,bx,by):
     return (bx-ax)*(py-ay)-(by-ay)*(px-ax)
 
@@ -301,7 +306,6 @@ def _fallback_bypass(sx,sy,ex,ey,union):
             off+=15.0
     return best or [(sx,sy),(ex,ey)]
 
-# ==================== 主规划入口 ====================
 def plan_route_core(start_gcj, end_gcj, obstacles, fh, sr, strategy):
     rl,rg=get_ref()
     sx,sy=ll2m(start_gcj[0],start_gcj[1],rl,rg)
@@ -638,7 +642,6 @@ def main():
     st.set_page_config(page_title="无人机地面站 v8",layout="wide",page_icon="✈️")
     st.title("✈️ 无人机地面站系统")
     st.caption("卫星实况地图 | 方向感知 Visibility Graph 最短路径 | 实时飞行监控")
-
     ss=st.session_state
     ss.heartbeat_count+=1
     hb={"seq":ss.heartbeat_count,"ts":datetime.now().strftime("%H:%M:%S"),
