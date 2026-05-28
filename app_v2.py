@@ -1,9 +1,8 @@
 """
-无人机地面站系统 - 流畅优化版
-- 缓存航线规划结果，避免重复计算
-- 减少页面闪烁和卡顿
-- 支持地图点击设置 A/B 点
-- 默认坐标：A(32.2323,118.749), B(32.2344,118.749)
+无人机地面站系统 - 手动规划模式
+- 初始：A(32.2323,118.749), B(32.2344,118.749)
+- 修改AB点不会自动规划，需点击"规划航线"
+- 绕行算法：Visibility Graph + 面积检测
 """
 
 import streamlit as st
@@ -14,64 +13,11 @@ import json, os, math, heapq, random
 from datetime import datetime
 from shapely.geometry import Polygon, LineString, Point
 from shapely.ops import unary_union
-import hashlib
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机地面站系统", layout="wide", page_icon="✈️")
 
-# ==================== 缓存工具 ====================
-def get_cache_key(start, end, obstacles, flight_height, safety_radius, strategy):
-    """生成缓存键，避免重复计算"""
-    key_data = {
-        "start": start, "end": end,
-        "obstacles": [(o["points"], o["height"]) for o in obstacles],
-        "fh": flight_height, "sr": safety_radius, "strategy": strategy
-    }
-    return hashlib.md5(json.dumps(key_data, sort_keys=True).encode()).hexdigest()
-
-# ==================== 文件持久化 ====================
-CONFIG_FILE = "obstacle_config.json"
-WP_FILE = "waypoints.json"
-
-def _wp_save():
-    ss = st.session_state
-    try:
-        with open(WP_FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "start_point": ss.start_point,
-                "end_point": ss.end_point,
-                "flight_height": ss.flight_height,
-                "safety_radius": ss.safety_radius
-            }, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def _wp_load():
-    if os.path.exists(WP_FILE):
-        try:
-            with open(WP_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return None
-
-def _obs_save():
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump({"obstacles": st.session_state.obstacles}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def _obs_load():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f).get("obstacles", [])
-        except Exception:
-            pass
-    return []
-
-# ==================== 默认值 ====================
+# ==================== 默认坐标（固定） ====================
 DEFAULT_A = {"lat": 32.2323, "lng": 118.7490, "height": 0}
 DEFAULT_B = {"lat": 32.2344, "lng": 118.7490, "height": 0}
 DEFAULT_FH = 10
@@ -81,21 +27,20 @@ DEFAULT_SR = 8
 def init_session_state():
     if "inited" in st.session_state:
         return
-    wp = _wp_load()
     st.session_state.inited = True
     st.session_state.heartbeat_count = 0
-    st.session_state.obstacles = _obs_load()
-    st.session_state.start_point = wp.get("start_point", DEFAULT_A.copy()) if wp else DEFAULT_A.copy()
-    st.session_state.end_point = wp.get("end_point", DEFAULT_B.copy()) if wp else DEFAULT_B.copy()
-    st.session_state.flight_height = wp.get("flight_height", DEFAULT_FH) if wp else DEFAULT_FH
-    st.session_state.safety_radius = wp.get("safety_radius", DEFAULT_SR) if wp else DEFAULT_SR
-    st.session_state.bypass_strategy = "best"
+    st.session_state.obstacles = []          # 障碍物列表
+    st.session_state.start_point = DEFAULT_A.copy()
+    st.session_state.end_point = DEFAULT_B.copy()
+    st.session_state.flight_height = DEFAULT_FH
+    st.session_state.safety_radius = DEFAULT_SR
+    st.session_state.bypass_strategy = "best"   # left, right, best
     st.session_state.planned_route = []
     st.session_state.route_analysis = {}
     st.session_state.setting_mode = None
-    st.session_state.obstacles_loaded = True
     st.session_state.map_key = 0
     st.session_state.new_obstacle_height = 60
+    # 飞行监控
     st.session_state.auto_flight_enabled = False
     st.session_state.flight_paused = False
     st.session_state.flight_progress = 0.0
@@ -109,41 +54,58 @@ def init_session_state():
     st.session_state.link_delay = 25
     st.session_state.link_loss = 0.1
     st.session_state.mission_started = False
-    # 用于触发重新规划的版本号
-    st.session_state.route_version = 0
+    # 持久化文件（可选）
+    st.session_state.obstacles_loaded = False
 
 init_session_state()
 
-# ==================== 回调函数（仅更新状态，不立即 rerun） ====================
-def on_start_lat_change():
-    st.session_state.start_point["lat"] = st.session_state.start_lat
-    _wp_save()
-    st.session_state.route_version += 1
+# ==================== 文件持久化（保存/加载障碍物，可选保存AB点） ====================
+OBSTACLE_FILE = "obstacle_config.json"
+WP_FILE = "waypoints.json"
 
-def on_start_lng_change():
-    st.session_state.start_point["lng"] = st.session_state.start_lng
-    _wp_save()
-    st.session_state.route_version += 1
+def save_obstacles():
+    with open(OBSTACLE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"obstacles": st.session_state.obstacles}, f, ensure_ascii=False, indent=2)
 
-def on_end_lat_change():
-    st.session_state.end_point["lat"] = st.session_state.end_lat
-    _wp_save()
-    st.session_state.route_version += 1
+def load_obstacles():
+    if os.path.exists(OBSTACLE_FILE):
+        with open(OBSTACLE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            st.session_state.obstacles = data.get("obstacles", [])
+            return True, len(st.session_state.obstacles)
+    return False, 0
 
-def on_end_lng_change():
-    st.session_state.end_point["lng"] = st.session_state.end_lng
-    _wp_save()
-    st.session_state.route_version += 1
+def auto_load_obstacles():
+    if not st.session_state.obstacles_loaded:
+        load_obstacles()
+        st.session_state.obstacles_loaded = True
 
-def on_fh_change():
-    st.session_state.flight_height = st.session_state.fh_input
-    _wp_save()
-    st.session_state.route_version += 1
+def save_wp():
+    """可选：保存起点终点坐标"""
+    try:
+        with open(WP_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "start_point": st.session_state.start_point,
+                "end_point": st.session_state.end_point,
+                "flight_height": st.session_state.flight_height,
+                "safety_radius": st.session_state.safety_radius
+            }, f, ensure_ascii=False, indent=2)
+    except:
+        pass
 
-def on_sr_change():
-    st.session_state.safety_radius = st.session_state.sr_input
-    _wp_save()
-    st.session_state.route_version += 1
+def load_wp():
+    if os.path.exists(WP_FILE):
+        try:
+            with open(WP_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                st.session_state.start_point = data.get("start_point", DEFAULT_A.copy())
+                st.session_state.end_point = data.get("end_point", DEFAULT_B.copy())
+                st.session_state.flight_height = data.get("flight_height", DEFAULT_FH)
+                st.session_state.safety_radius = data.get("safety_radius", DEFAULT_SR)
+                return True
+        except:
+            pass
+    return False
 
 # ==================== GCJ-02 <-> WGS-84 ====================
 _AE = 6378245.0
@@ -381,14 +343,16 @@ def _fallback(sx, sy, ex, ey, union):
             off += 12.0
     return best or [(sx, sy), (ex, ey)]
 
-# ==================== 缓存化规划函数 ====================
-@st.cache_data(ttl=3600, show_spinner="计算最优航线中...")
-def compute_route(start, end, obstacles_tuple, flight_height, safety_radius, strategy):
-    """实际计算航线，使用缓存避免重复计算"""
-    start_pt = (start["lat"], start["lng"])
-    end_pt = (end["lat"], end["lng"])
-    # 还原障碍物列表
-    obs_list = [{"points": pts, "height": h} for (pts, h) in obstacles_tuple]
+# ==================== 核心规划函数（手动调用） ====================
+def plan_route():
+    """手动规划航线，更新 session_state"""
+    ss = st.session_state
+    start = (ss.start_point["lat"], ss.start_point["lng"])
+    end = (ss.end_point["lat"], ss.end_point["lng"])
+    fh = ss.flight_height
+    sr = ss.safety_radius
+    strategy = ss.bypass_strategy
+    obs = ss.obstacles
 
     analysis = {
         "total_distance": 0,
@@ -399,30 +363,40 @@ def compute_route(start, end, obstacles_tuple, flight_height, safety_radius, str
         "strategy_used": ""
     }
 
-    for o in obs_list:
+    # 统计障碍物处理方式
+    for o in obs:
         h = o.get("height", 30)
-        if h > flight_height:
+        if h > fh:
             analysis["obstacles_encountered"].append({"height": h, "decision": "绕行"})
         else:
             analysis["fly_over_count"] += 1
             analysis["obstacles_encountered"].append({"height": h, "decision": "飞跃(低)"})
 
-    rl, rg = ((start_pt[0]+end_pt[0])/2, (start_pt[1]+end_pt[1])/2)
-    union = build_union(obs_list, flight_height, safety_radius, rl, rg)
+    rl, rg = get_ref()
+    union = build_union(obs, fh, sr, rl, rg)
 
+    # 无障碍物或union为空
     if union is None or union.is_empty:
-        route = [start_pt, end_pt]
-        analysis.update(total_distance=hdist(start_pt, end_pt), strategy_used="直线（无障碍）", route_points=route)
+        route = [start, end]
+        analysis.update(total_distance=hdist(start, end), strategy_used="直线（无障碍）", route_points=route)
+        ss.planned_route = route
+        ss.route_analysis = analysis
+        ss.map_key += 1
         return route, analysis
 
-    sx, sy = ll2m(start_pt[0], start_pt[1], rl, rg)
-    ex, ey = ll2m(end_pt[0], end_pt[1], rl, rg)
+    sx, sy = ll2m(start[0], start[1], rl, rg)
+    ex, ey = ll2m(end[0], end[1], rl, rg)
 
+    # 直线不碰障碍物
     if not _direct_blocked(sx, sy, ex, ey, union):
-        route = [start_pt, end_pt]
-        analysis.update(total_distance=hdist(start_pt, end_pt), strategy_used="直线（不碰障碍物）", route_points=route)
+        route = [start, end]
+        analysis.update(total_distance=hdist(start, end), strategy_used="直线（不碰障碍物）", route_points=route)
+        ss.planned_route = route
+        ss.route_analysis = analysis
+        ss.map_key += 1
         return route, analysis
 
+    # 根据策略规划
     path_m = None
     strat_name = ""
     if strategy == "left":
@@ -431,7 +405,7 @@ def compute_route(start, end, obstacles_tuple, flight_height, safety_radius, str
     elif strategy == "right":
         path_m = _plan_side(sx, sy, ex, ey, union, "right")
         strat_name = "右侧绕行"
-    else:
+    else:  # best
         pm_l = _plan_side(sx, sy, ex, ey, union, "left")
         pm_r = _plan_side(sx, sy, ex, ey, union, "right")
         def ml(pm):
@@ -459,23 +433,12 @@ def compute_route(start, end, obstacles_tuple, flight_height, safety_radius, str
         strategy_used=f"{strat_name}（{nbp}个绕行点）",
         route_points=route
     )
-    return route, analysis
-
-def plan_route():
-    """触发重新规划（由版本号变化自动调用）"""
-    ss = st.session_state
-    # 将障碍物转换为可哈希的元组
-    obstacles_tuple = tuple((tuple(tuple(p) for p in o["points"]), o["height"]) for o in ss.obstacles)
-    route, analysis = compute_route(
-        ss.start_point, ss.end_point, obstacles_tuple,
-        ss.flight_height, ss.safety_radius, ss.bypass_strategy
-    )
     ss.planned_route = route
     ss.route_analysis = analysis
     ss.map_key += 1
     return route, analysis
 
-# ==================== 飞行控制 ====================
+# ==================== 飞行控制（自动飞行，与规划无关） ====================
 def reset_flight():
     ss = st.session_state
     ss.auto_flight_enabled = False
@@ -514,6 +477,67 @@ def step_forward():
     if total > 0:
         ss.flight_time_elapsed = int((ss.flight_progress * total) / ss.flight_speed)
     ss.flight_battery = max(0, 100 - ss.flight_progress * 5)
+
+def render_flight_monitor():
+    ss = st.session_state
+    st.markdown("### ✈️ 飞行实时画面 - 任务执行监控")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        if st.button("▶ 开始任务", type="primary", use_container_width=True, disabled=ss.auto_flight_enabled):
+            if not ss.planned_route:
+                st.error("请先规划航线！")
+            else:
+                reset_flight()
+                ss.auto_flight_enabled = True
+                ss.mission_started = True
+                add_log("GCS→OBC→FCU", "START_MISSION | Mode: AUTO")
+                add_log("业务流程", "任务开始")
+                st.rerun()
+    with c2:
+        if st.button("⏸️ 暂停", use_container_width=True, disabled=not ss.auto_flight_enabled or ss.flight_paused):
+            ss.flight_paused = True
+            ss.auto_flight_enabled = False
+            add_log("GCS→OBC→FCU", "PAUSE")
+            st.rerun()
+    with c3:
+        if st.button("⏹️ 停止", use_container_width=True, disabled=not (ss.auto_flight_enabled or ss.flight_paused)):
+            ss.auto_flight_enabled = False
+            ss.flight_paused = False
+            add_log("GCS→OBC→FCU", "STOP")
+            st.rerun()
+    with c4:
+        if st.button("🔄 重置", use_container_width=True):
+            reset_flight()
+            st.rerun()
+
+    if ss.auto_flight_enabled and not ss.flight_paused:
+        if ss.planned_route and ss.current_waypoint_idx < len(ss.planned_route)-1:
+            step_forward()
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=350, key="afr")
+        else:
+            ss.auto_flight_enabled = False
+            st.success("✅ 已到达终点！任务完成")
+
+    twp = len(ss.planned_route) if ss.planned_route else 0
+    cwp = ss.current_waypoint_idx + 1
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    with col1:
+        st.metric("当前航点", f"{cwp}/{twp}")
+    with col2:
+        st.metric("飞行速度", f"{ss.flight_speed:.1f} m/s")
+    with col3:
+        mv, sv = ss.flight_time_elapsed // 60, ss.flight_time_elapsed % 60
+        st.metric("已用时间", f"{mv:02d}:{sv:02d}")
+    with col4:
+        st.metric("剩余距离", f"{ss.flight_remaining_dist:.0f} m")
+    with col5:
+        eta = int(ss.flight_remaining_dist / ss.flight_speed) if ss.flight_speed > 0 else 0
+        st.metric("预计到达", f"{eta//60:02d}:{eta%60:02d}")
+    with col6:
+        b = ss.flight_battery
+        st.metric("电量模拟", f"{'🟢' if b>50 else '🟡' if b>20 else '🔴'} {b:.0f}%")
+    st.progress(ss.flight_progress, text=f"任务进度:{ss.flight_progress*100:.1f}% | {cwp}/{twp} 航点")
 
 # ==================== 地图 ====================
 def create_map():
@@ -718,86 +742,7 @@ OBC↔FCU: {"正常" if good else "延迟高"} &nbsp; 延迟:~{ss.link_delay}ms 
                     h2 += f'<div style="border-bottom:1px dashed #ece;padding:2px 0;"><span style="color:#888;">[{l["time"]}]</span> FCU→OBC→GCS: <b>{l["message"]}</b></div>'
                 st.markdown(h2+'</div>', unsafe_allow_html=True)
 
-# ==================== 飞行监控 ====================
-def render_flight_monitor():
-    ss = st.session_state
-    st.markdown("### ✈️ 飞行实时画面 - 任务执行监控")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        if st.button("▶ 开始任务", type="primary", use_container_width=True, disabled=ss.auto_flight_enabled):
-            if not ss.planned_route:
-                st.error("请先规划航线！")
-            else:
-                reset_flight()
-                ss.auto_flight_enabled = True
-                ss.mission_started = True
-                add_log("GCS→OBC→FCU", "START_MISSION | Mode: AUTO")
-                add_log("业务流程", "任务开始")
-                st.rerun()
-    with c2:
-        if st.button("⏸️ 暂停", use_container_width=True, disabled=not ss.auto_flight_enabled or ss.flight_paused):
-            ss.flight_paused = True
-            ss.auto_flight_enabled = False
-            add_log("GCS→OBC→FCU", "PAUSE")
-            st.rerun()
-    with c3:
-        if st.button("⏹️ 停止", use_container_width=True, disabled=not (ss.auto_flight_enabled or ss.flight_paused)):
-            ss.auto_flight_enabled = False
-            ss.flight_paused = False
-            add_log("GCS→OBC→FCU", "STOP")
-            st.rerun()
-    with c4:
-        if st.button("🔄 重置", use_container_width=True):
-            reset_flight()
-            st.rerun()
-
-    if ss.auto_flight_enabled and not ss.flight_paused:
-        if ss.planned_route and ss.current_waypoint_idx < len(ss.planned_route)-1:
-            step_forward()
-            from streamlit_autorefresh import st_autorefresh
-            st_autorefresh(interval=350, key="afr")
-        else:
-            ss.auto_flight_enabled = False
-            st.success("✅ 已到达终点！任务完成")
-
-    twp = len(ss.planned_route) if ss.planned_route else 0
-    cwp = ss.current_waypoint_idx + 1
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    with c1:
-        st.metric("当前航点", f"{cwp}/{twp}")
-    with c2:
-        st.metric("飞行速度", f"{ss.flight_speed:.1f} m/s")
-    with c3:
-        mv, sv = ss.flight_time_elapsed // 60, ss.flight_time_elapsed % 60
-        st.metric("已用时间", f"{mv:02d}:{sv:02d}")
-    with c4:
-        st.metric("剩余距离", f"{ss.flight_remaining_dist:.0f} m")
-    with c5:
-        eta = int(ss.flight_remaining_dist / ss.flight_speed) if ss.flight_speed > 0 else 0
-        st.metric("预计到达", f"{eta//60:02d}:{eta%60:02d}")
-    with c6:
-        b = ss.flight_battery
-        st.metric("电量模拟", f"{'🟢' if b>50 else '🟡' if b>20 else '🔴'} {b:.0f}%")
-    st.progress(ss.flight_progress, text=f"任务进度:{ss.flight_progress*100:.1f}% | {cwp}/{twp} 航点")
-
 # ==================== 障碍物管理 ====================
-def save_obstacles():
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump({"obstacles": st.session_state.obstacles}, f, ensure_ascii=False, indent=2)
-
-def load_obstacles():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            st.session_state.obstacles = data.get("obstacles", [])
-            return True, len(st.session_state.obstacles)
-    return False, 0
-
-def auto_load_obstacles():
-    if not st.session_state.obstacles_loaded:
-        load_obstacles()
-        st.session_state.obstacles_loaded = True
-
 def add_obstacle_from_draw(feature):
     try:
         if feature.get('geometry', {}).get('type') == 'Polygon':
@@ -817,7 +762,6 @@ def add_obstacle_from_draw(feature):
                 })
                 save_obstacles()
                 add_log("业务流程", f"障碍物已添加|高度:{h}m|顶点:{len(pts)}")
-                st.session_state.route_version += 1
                 return True
     except Exception as e:
         st.error(f"添加障碍物失败:{e}")
@@ -827,12 +771,10 @@ def remove_obstacle(idx):
     if 0 <= idx < len(st.session_state.obstacles):
         st.session_state.obstacles.pop(idx)
         save_obstacles()
-        st.session_state.route_version += 1
 
 def clear_obstacles():
     st.session_state.obstacles = []
     save_obstacles()
-    st.session_state.route_version += 1
 
 def heartbeat():
     st.session_state.heartbeat_count += 1
@@ -846,21 +788,20 @@ def heartbeat():
 # ==================== 主函数 ====================
 def main():
     st.title("✈️ 无人机地面站系统")
-    st.caption("卫星实况地图 | 智能绕行算法 | 流畅优化版 | 起点(32.2323,118.749) 终点(32.2344,118.749)")
+    st.caption("卫星实况地图 | 智能绕行算法 | 手动规划模式 | 起(32.2323,118.749) 终(32.2344,118.749)")
 
+    # 加载障碍物
     auto_load_obstacles()
+    # 可选：加载之前的AB点（注释掉则始终使用默认值）
+    # load_wp()
+
     hb = heartbeat()
     c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        st.metric("💓 心跳", "在线")
-    with c2:
-        st.metric("📡 序列号", hb["sequence"])
-    with c3:
-        st.metric("🔋 电量", f"{hb['battery']}%")
-    with c4:
-        st.metric("📶 信号", f"{hb['signal']}%")
-    with c5:
-        st.metric("🕐 时间", hb["timestamp"])
+    with c1: st.metric("💓 心跳", "在线")
+    with c2: st.metric("📡 序列号", hb["sequence"])
+    with c3: st.metric("🔋 电量", f"{hb['battery']}%")
+    with c4: st.metric("📶 信号", f"{hb['signal']}%")
+    with c5: st.metric("🕐 时间", hb["timestamp"])
     st.divider()
     render_flight_monitor()
     st.divider()
@@ -886,111 +827,95 @@ def main():
             with mc4:
                 if st.button("⬅️ 左绕行", use_container_width=True):
                     ss.bypass_strategy = "left"
-                    ss.route_version += 1
-                    st.rerun()
             with mc5:
                 if st.button("➡️ 右绕行", use_container_width=True):
                     ss.bypass_strategy = "right"
-                    ss.route_version += 1
-                    st.rerun()
             with mc6:
                 if st.button("🌟 最佳航线", type="primary", use_container_width=True):
                     ss.bypass_strategy = "best"
-                    ss.route_version += 1
-                    st.rerun()
-
-            # 版本变化时自动重新规划
-            if "last_version" not in st.session_state or st.session_state.last_version != st.session_state.route_version:
-                st.session_state.last_version = st.session_state.route_version
-                with st.spinner("正在规划最优航线..."):
-                    plan_route()
-                    add_log("业务流程", f"航线规划完成 | 航点数:{len(st.session_state.planned_route)} | 距离:{st.session_state.route_analysis.get('total_distance',0):.1f}m")
-                st.rerun()
 
             mode = ss.setting_mode
-            sl = {"left": "⬅️左绕行", "right": "➡️右绕行", "best": "🌟最佳"}.get(ss.bypass_strategy, "")
             if mode == "start":
-                st.info("🔵 点击地图设置起点A（设置完自动退出）")
+                st.info("🔵 点击地图设置起点A")
             elif mode == "end":
-                st.info("🔴 点击地图设置终点B（设置完自动退出）")
+                st.info("🔴 点击地图设置终点B")
             else:
-                inf = ss.auto_flight_enabled or ss.flight_paused or ss.mission_started
-                st.caption(f"当前:{sl} | " +
-                           ("🟢绿线=已飞|🔵蓝虚=待飞|🟠=无人机" if inf else
-                            "🔵蓝虚=规划|🔴红=高障|🟠橙=低障|黄虚=安全缓冲"))
+                st.caption("当前策略：" + ("左绕行" if ss.bypass_strategy=="left" else "右绕行" if ss.bypass_strategy=="right" else "最佳"))
+                if st.button("✈️ 规划航线", type="primary", use_container_width=True):
+                    with st.spinner("正在规划航线..."):
+                        plan_route()
+                        add_log("业务流程", f"手动规划航线 | 航点数:{len(ss.planned_route)} | 距离:{ss.route_analysis.get('total_distance',0):.1f}m")
+                    st.success("航线规划完成！")
+                    st.rerun()
 
+            # 地图绘制
             try:
                 mp = create_map()
                 out = st_folium(mp, width=820, height=560,
                                 key=f"map_{ss.map_key}",
                                 returned_objects=["last_active_drawing", "last_clicked"])
 
-                # 处理地图点击设置A/B点
+                # 处理地图点击设置 A/B 点
                 if out and out.get("last_clicked"):
                     ck = out["last_clicked"]
                     cur_mode = ss.setting_mode
                     if ck and "lat" in ck and "lng" in ck and cur_mode in ("start", "end"):
                         gl, gg = wgs2gcj(ck["lat"], ck["lng"])
-                        ss.setting_mode = None
+                        ss.setting_mode = None   # 清除模式
                         if cur_mode == "start":
                             ss.start_point = {"lat": gl, "lng": gg, "height": 0}
                             add_log("GCS→OBC→FCU", f"SET_START ({gl:.5f},{gg:.5f})")
                         else:
                             ss.end_point = {"lat": gl, "lng": gg, "height": 0}
                             add_log("GCS→OBC→FCU", f"SET_END ({gl:.5f},{gg:.5f})")
-                        _wp_save()
-                        ss.route_version += 1
+                        # 可选：保存AB点
+                        # save_wp()
                         st.rerun()
 
+                # 添加障碍物
                 if out and out.get("last_active_drawing"):
                     feat = out["last_active_drawing"]
                     if feat.get("geometry", {}).get("type") == "Polygon":
                         if add_obstacle_from_draw(feat):
-                            st.success("✅ 障碍物已添加，航线已重新规划")
+                            st.success("✅ 障碍物已添加")
                             st.rerun()
             except Exception as e:
                 st.error(f"地图错误: {e}")
-                import traceback
-                st.code(traceback.format_exc())
 
         with mid:
             ss = st.session_state
             st.subheader("🎮 控制面板")
             with st.expander("📍 起点 A（GCJ-02）", expanded=True):
-                st.number_input(
-                    "纬度", value=ss.start_point["lat"], format="%.6f",
-                    key="start_lat", on_change=on_start_lat_change
-                )
-                st.number_input(
-                    "经度", value=ss.start_point["lng"], format="%.6f",
-                    key="start_lng", on_change=on_start_lng_change
-                )
+                # 直接绑定到session_state，修改后不自动规划
+                start_lat = st.number_input("纬度", value=ss.start_point["lat"], format="%.6f", key="start_lat")
+                start_lng = st.number_input("经度", value=ss.start_point["lng"], format="%.6f", key="start_lng")
+                if start_lat != ss.start_point["lat"] or start_lng != ss.start_point["lng"]:
+                    ss.start_point = {"lat": start_lat, "lng": start_lng, "height": 0}
+                    # 可选保存
+                    # save_wp()
             with st.expander("🏁 终点 B（GCJ-02）", expanded=True):
-                st.number_input(
-                    "纬度", value=ss.end_point["lat"], format="%.6f",
-                    key="end_lat", on_change=on_end_lat_change
-                )
-                st.number_input(
-                    "经度", value=ss.end_point["lng"], format="%.6f",
-                    key="end_lng", on_change=on_end_lng_change
-                )
+                end_lat = st.number_input("纬度", value=ss.end_point["lat"], format="%.6f", key="end_lat")
+                end_lng = st.number_input("经度", value=ss.end_point["lng"], format="%.6f", key="end_lng")
+                if end_lat != ss.end_point["lat"] or end_lng != ss.end_point["lng"]:
+                    ss.end_point = {"lat": end_lat, "lng": end_lng, "height": 0}
+                    # save_wp()
             st.divider()
             st.subheader("✈️ 飞行参数")
-            st.number_input(
-                "飞行高度 (m)", value=ss.flight_height, step=5, min_value=10, max_value=200,
-                key="fh_input", on_change=on_fh_change
-            )
-            st.number_input(
-                "安全半径 (m)", value=ss.safety_radius, step=1, min_value=5, max_value=50,
-                key="sr_input", on_change=on_sr_change
-            )
+            fh = st.number_input("飞行高度 (m)", value=ss.flight_height, step=5, min_value=10, max_value=200)
+            if fh != ss.flight_height:
+                ss.flight_height = fh
+                # save_wp()
+            sr = st.number_input("安全半径 (m)", value=ss.safety_radius, step=1, min_value=5, max_value=50)
+            if sr != ss.safety_radius:
+                ss.safety_radius = sr
+                # save_wp()
             spd = st.slider("飞行速度 (m/s)", 1.0, 20.0, value=float(ss.flight_speed), step=0.5)
-            if abs(spd - ss.flight_speed) > 0.01:
+            if spd != ss.flight_speed:
                 ss.flight_speed = spd
             st.divider()
             st.subheader("⛔ 新障碍物高度")
-            st.number_input("障碍物高度 (m)", value=60, step=5, min_value=10, max_value=200, key="new_obstacle_height")
-            st.caption("💡 在地图上用多边形工具绘制障碍物区域")
+            st.number_input("高度 (m)", value=60, step=5, min_value=10, max_value=200, key="new_obstacle_height")
+            st.caption("💡 在地图上用多边形工具绘制")
 
         with right:
             ss = st.session_state
@@ -1006,51 +931,37 @@ def main():
                 for o in a.get('obstacles_encountered', []):
                     st.text(f"{'🔄' if '绕行' in o['decision'] else '✅'} {o['height']}m → {o['decision']}")
             else:
-                st.info("点击规划按钮生成报告")
+                st.info("点击「规划航线」生成报告")
             st.divider()
             st.subheader("⛔ 障碍物列表")
             if ss.obstacles:
-                st.caption(f"共 {len(ss.obstacles)} 个障碍物")
+                st.caption(f"共 {len(ss.obstacles)} 个")
                 for idx, obs in enumerate(ss.obstacles):
-                    ca, cb, cc = st.columns([1, 2, 1])
-                    with ca:
+                    col1, col2, col3 = st.columns([1,2,1])
+                    with col1:
                         if st.button("🗑️", key=f"d{idx}"):
                             remove_obstacle(idx)
                             st.rerun()
-                    with cb:
+                    with col2:
                         st.text(f"障碍 {idx+1}")
-                        if obs.get('created_at'):
-                            st.caption(obs['created_at'][:10])
-                    with cc:
+                    with col3:
                         h_ = obs.get('height', 10)
                         st.text(f"{'🔴' if h_ > ss.flight_height else '🟠'} {h_}m")
             else:
-                st.info("暂无障碍物\n在地图绘制多边形添加")
+                st.info("暂无障碍物")
             st.divider()
-            cs, cl, cc2 = st.columns(3)
-            with cs:
-                if st.button("💾 保存", use_container_width=True):
+            col_s, col_l, col_c = st.columns(3)
+            with col_s:
+                if st.button("💾 保存障碍物", use_container_width=True):
                     save_obstacles()
-                    _wp_save()
                     st.success("已保存")
-            with cl:
-                if st.button("📂 加载", use_container_width=True):
-                    ok, cnt = load_obstacles()
-                    wp = _wp_load()
-                    if wp:
-                        if "start_point" in wp:
-                            ss.start_point = wp["start_point"]
-                        if "end_point" in wp:
-                            ss.end_point = wp["end_point"]
-                        if "flight_height" in wp:
-                            ss.flight_height = wp["flight_height"]
-                        if "safety_radius" in wp:
-                            ss.safety_radius = wp["safety_radius"]
-                    st.success(f"已加载{cnt}个障碍物及起终点")
-                    ss.route_version += 1
+            with col_l:
+                if st.button("📂 加载障碍物", use_container_width=True):
+                    load_obstacles()
+                    st.success(f"已加载 {len(ss.obstacles)} 个障碍物")
                     st.rerun()
-            with cc2:
-                if st.button("🗑️ 清空", use_container_width=True):
+            with col_c:
+                if st.button("🗑️ 清空障碍物", use_container_width=True):
                     clear_obstacles()
                     st.rerun()
 
