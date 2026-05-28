@@ -174,10 +174,6 @@ def plen(path):
 
 # ==================== 安全缓冲区 ====================
 def build_union(obs, fh, sr, rl, rg):
-    """
-    构建所有高于飞行高度的障碍物安全缓冲区联合体（米制坐标）。
-    buffer = safety_radius，不再额外加余量，让路径贴边走。
-    """
     polys = []
     for o in obs:
         if o.get("height", 30) <= fh:
@@ -191,7 +187,7 @@ def build_union(obs, fh, sr, rl, rg):
             if not poly.is_valid:
                 poly = poly.buffer(0)
             if poly.is_valid and poly.area > 0:
-                polys.append(poly.buffer(float(sr)))
+                polys.append(poly.buffer(float(sr)+3.0))
         except:
             continue
     if not polys:
@@ -199,210 +195,152 @@ def build_union(obs, fh, sr, rl, rg):
     u = unary_union(polys)
     return u if not u.is_empty else None
 
-# ==================== 线段安全检测（distance 法，100% 可靠）====================
 def _seg_collides(ax, ay, bx, by, union_geom):
-    """
-    最可靠的碰撞检测：
-    1. 用 union_geom.distance(segment) 判断距离
-       - distance == 0 表示线段与缓冲区接触或相交
-    2. 额外检查：若起点或终点在缓冲区内
-    distance 方法不依赖面积，对任意几何精度都稳定。
-    """
-    # 检查端点
-    if union_geom.distance(Point(ax, ay)) < 0.01:
-        return True
-    if union_geom.distance(Point(bx, by)) < 0.01:
-        return True
-    # 检查线段本体
     seg = LineString([(ax, ay), (bx, by)])
     if seg.length < 1e-6:
-        return False
-    # distance == 0 表示相交（含内部穿过）
-    return union_geom.distance(seg) < 0.01
+        return union_geom.distance(Point(ax, ay)) < 0.1
+    seg_buf = seg.buffer(0.1, cap_style=2, join_style=2)
+    inter = seg_buf.intersection(union_geom)
+    return inter.area > 1e-6
 
 def _seg_free(ax, ay, bx, by, union_geom):
     return not _seg_collides(ax, ay, bx, by, union_geom)
 
 def _direct_blocked(sx, sy, ex, ey, union_geom):
-    """判断直线是否与障碍物缓冲区有任何接触"""
     return _seg_collides(sx, sy, ex, ey, union_geom)
 
-# ==================== Visibility Graph + Dijkstra ====================
-def _cross(px, py, ax, ay, bx, by):
-    """叉积：判断点(px,py)在有向线段(A→B)的哪侧。>0左侧，<0右侧，=0在线上"""
-    return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+# ==================== Visibility Graph ====================
+def _side(px, py, ax, ay, bx, by):
+    return (bx-ax)*(py-ay) - (by-ay)*(px-ax)
 
 def _push_out(px, py, tx, ty, union_geom):
-    """若点在缓冲区内（距离<0.5m），沿背向目标方向推出直到安全"""
-    if union_geom.distance(Point(px, py)) > 0.5:
+    if union_geom.distance(Point(px, py)) > 0.1:
         return px, py
-    vl = math.hypot(tx - px, ty - py) or 1.0
-    vx, vy = (tx - px) / vl, (ty - py) / vl
-    for d in range(1, 200):
-        nx, ny = px - vx * d, py - vy * d
-        if union_geom.distance(Point(nx, ny)) > 0.5:
+    vl = math.hypot(tx-px, ty-py) or 1
+    vx, vy = (tx-px)/vl, (ty-py)/vl
+    for d in range(2, 150, 2):
+        nx, ny = px - vx*d, py - vy*d
+        if union_geom.distance(Point(nx, ny)) > 0.2:
             return nx, ny
     return px, py
 
-def _get_side_nodes(union_geom, sx, sy, ex, ey, side):
-    """
-    从障碍物缓冲区轮廓提取方向感知的候选节点。
-
-    关键修复：严格区分左右
-    - side='left' : 叉积 > 0（严格左侧），不包含右侧顶点
-    - side='right': 叉积 < 0（严格右侧），不包含左侧顶点
-    - side='both' : 全部顶点（兜底用）
-
-    同时对每个顶点做额外偏移：确保候选节点本身在缓冲区外部（贴边但不在内部）。
-    """
-    base_nodes = [(sx, sy), (ex, ey)]
-    geoms = ([union_geom] if union_geom.geom_type == 'Polygon'
-             else [g for g in union_geom.geoms if g.geom_type == 'Polygon'])
-
-    # 方向向量（起点→终点），用于计算切向偏移
-    main_len = math.hypot(ex - sx, ey - sy) or 1.0
-    # 垂直于主方向的单位向量（左方）
-    perp_left_x  = -(ey - sy) / main_len
-    perp_left_y  =  (ex - sx) / main_len
-
+def _nodes_sided(union_geom, sx, sy, ex, ey, side):
+    nodes = [(sx, sy), (ex, ey)]
+    geoms = [union_geom] if union_geom.geom_type == 'Polygon' else [g for g in union_geom.geoms if g.geom_type == 'Polygon']
     for g in geoms:
-        coords = list(g.exterior.coords)[:-1]
-        for cx, cy in coords:
-            c_val = _cross(cx, cy, sx, sy, ex, ey)
-            include = False
-            if side == 'left'  and c_val > 0:   include = True
-            elif side == 'right' and c_val < 0: include = True
-            elif side == 'both':                 include = True
-
-            if include:
-                # 确保候选点在缓冲区外：若点在内部则向外推 0.5m
-                pt = Point(cx, cy)
-                if union_geom.distance(pt) < 0.3:
-                    # 推向远离障碍物中心的方向
-                    try:
-                        centroid = g.centroid
-                        dx = cx - centroid.x; dy = cy - centroid.y
-                        dl = math.hypot(dx, dy) or 1.0
-                        cx2 = cx + dx / dl * 0.5
-                        cy2 = cy + dy / dl * 0.5
-                        base_nodes.append((cx2, cy2))
-                    except:
-                        base_nodes.append((cx, cy))
-                else:
-                    base_nodes.append((cx, cy))
-
-    # 去重（精度 0.5m）
-    seen = set(); unique = []
-    for n in base_nodes:
-        k = (round(n[0] * 2) / 2, round(n[1] * 2) / 2)
+        for cx, cy in list(g.exterior.coords)[:-1]:
+            s = _side(cx, cy, sx, sy, ex, ey)
+            if side == 'left' and s > -1.0:
+                nodes.append((cx, cy))
+            elif side == 'right' and s < 1.0:
+                nodes.append((cx, cy))
+            elif side == 'both':
+                nodes.append((cx, cy))
+    seen = set()
+    out = []
+    for n in nodes:
+        k = (round(n[0], 1), round(n[1], 1))
         if k not in seen:
-            seen.add(k); unique.append(n)
-    return unique
+            seen.add(k)
+            out.append(n)
+    return out
 
 def _dijkstra(nodes, union_geom):
-    """标准 Dijkstra，nodes[0]=起点，nodes[1]=终点，返回最短路径节点列表"""
     n = len(nodes)
     adj = [[] for _ in range(n)]
     for i in range(n):
-        for j in range(i + 1, n):
-            ax, ay = nodes[i]; bx, by = nodes[j]
+        for j in range(i+1, n):
+            ax, ay = nodes[i]
+            bx, by = nodes[j]
             if _seg_free(ax, ay, bx, by, union_geom):
-                d = math.hypot(bx - ax, by - ay)
-                adj[i].append((j, d)); adj[j].append((i, d))
+                d = math.hypot(bx-ax, by-ay)
+                adj[i].append((j, d))
+                adj[j].append((i, d))
     INF = float('inf')
-    dist = [INF] * n; prev = [-1] * n; dist[0] = 0.0
+    dist = [INF]*n
+    prev = [-1]*n
+    dist[0] = 0.0
     heap = [(0.0, 0)]
     while heap:
         cost, u = heapq.heappop(heap)
-        if cost > dist[u]: continue
-        if u == 1: break
+        if cost > dist[u]:
+            continue
+        if u == 1:
+            break
         for v, w in adj[u]:
             nc = cost + w
             if nc < dist[v]:
-                dist[v] = nc; prev[v] = u; heapq.heappush(heap, (nc, v))
+                dist[v] = nc
+                prev[v] = u
+                heapq.heappush(heap, (nc, v))
     if dist[1] == INF:
         return None
-    path = []; cur = 1
-    while cur != -1: path.append(cur); cur = prev[cur]
+    path = []
+    cur = 1
+    while cur != -1:
+        path.append(cur)
+        cur = prev[cur]
     path.reverse()
     return [nodes[i] for i in path]
 
 def _smooth(path_m, union_geom):
-    """贪心路径平滑：跳过视线内多余节点，使路径更短"""
     if len(path_m) <= 2:
         return path_m
-    out = [path_m[0]]; i = 0
-    while i < len(path_m) - 1:
-        j = len(path_m) - 1
-        while j > i + 1:
+    out = [path_m[0]]
+    i = 0
+    while i < len(path_m)-1:
+        j = len(path_m)-1
+        while j > i+1:
             if _seg_free(*path_m[i], *path_m[j], union_geom):
                 break
             j -= 1
-        out.append(path_m[j]); i = j
+        out.append(path_m[j])
+        i = j
     return out
 
 def _plan_side(sx, sy, ex, ey, union, side):
-    """
-    在指定方向（left/right/both）用 Visibility Graph + Dijkstra 规划路径。
-    返回米制坐标列表，或 None（无解时）。
-    """
-    # 若起终点在缓冲区内先推出
     sx2, sy2 = _push_out(sx, sy, ex, ey, union)
     ex2, ey2 = _push_out(ex, ey, sx, sy, union)
-    nodes = _get_side_nodes(union, sx2, sy2, ex2, ey2, side)
+    nodes = _nodes_sided(union, sx2, sy2, ex2, ey2, side)
     if len(nodes) < 2:
         return None
     pm = _dijkstra(nodes, union)
     if not pm or len(pm) < 2:
         return None
     pm = _smooth(pm, union)
-    # 还原真实起终点（push_out 可能偏移了）
-    pm[0]  = (sx, sy)
+    pm[0] = (sx, sy)
     pm[-1] = (ex, ey)
     return pm
 
 def _fallback(sx, sy, ex, ey, union):
-    """
-    兜底方案：左/右两个方向各尝试简单弧形偏移，取安全且最短的。
-    只在 Visibility Graph 完全失败时使用。
-    """
-    L = math.hypot(ex - sx, ey - sy)
+    L = math.hypot(ex-sx, ey-sy)
     if L < 1e-6:
         return [(sx, sy), (ex, ey)]
-    dx, dy = (ex - sx) / L, (ey - sy) / L
-    best, best_len = None, float('inf')
-
-    for perp_x, perp_y in [(-dy, dx), (dy, -dx)]:
-        # 计算障碍物在垂直方向的最大投影距离
+    dx, dy = (ex-sx)/L, (ey-sy)/L
+    best, bl = None, float('inf')
+    for px, py in [(-dy, dx), (dy, -dx)]:
         max_proj = 0.0
         geoms = [union] if union.geom_type == 'Polygon' else list(union.geoms)
         for g in geoms:
             if hasattr(g, 'exterior'):
                 for c in g.exterior.coords:
-                    proj = (c[0] - sx) * perp_x + (c[1] - sy) * perp_y
+                    proj = (c[0]-sx)*px + (c[1]-sy)*py
                     if proj > max_proj:
                         max_proj = proj
-        # 从最小偏移开始逐渐加大，直到路径安全
-        offset = max_proj + 2.0
-        for _ in range(20):
-            cand = [
-                (sx, sy),
-                (sx + dx * L * 0.35 + perp_x * offset, sy + dy * L * 0.35 + perp_y * offset),
-                (sx + dx * L * 0.65 + perp_x * offset, sy + dy * L * 0.65 + perp_y * offset),
-                (ex, ey)
-            ]
-            ok = all(
-                _seg_free(cand[k][0], cand[k][1], cand[k+1][0], cand[k+1][1], union)
-                for k in range(len(cand) - 1)
-            )
+        off = max_proj + 5.0
+        for _ in range(15):
+            cand = [(sx, sy),
+                    (sx+dx*L*0.35+px*off, sy+dy*L*0.35+py*off),
+                    (sx+dx*L*0.65+px*off, sy+dy*L*0.65+py*off),
+                    (ex, ey)]
+            ok = all(_seg_free(cand[k][0], cand[k][1], cand[k+1][0], cand[k+1][1], union) for k in range(3))
             if ok:
-                tl = sum(math.hypot(cand[k+1][0]-cand[k][0], cand[k+1][1]-cand[k][1])
-                         for k in range(len(cand) - 1))
-                if tl < best_len:
-                    best_len = tl; best = cand
+                tl = sum(math.hypot(cand[k+1][0]-cand[k][0], cand[k+1][1]-cand[k][1]) for k in range(3))
+                if tl < bl:
+                    bl = tl
+                    best = cand
                 break
-            offset += 8.0   # 每次增量小一点，路径更贴边
-
+            off += 12.0
     return best or [(sx, sy), (ex, ey)]
 
 # ==================== 核心规划函数（手动调用） ====================
@@ -410,11 +348,11 @@ def plan_route():
     """手动规划航线，更新 session_state"""
     ss = st.session_state
     start = (ss.start_point["lat"], ss.start_point["lng"])
-    end   = (ss.end_point["lat"],   ss.end_point["lng"])
-    fh       = ss.flight_height
-    sr       = ss.safety_radius
+    end = (ss.end_point["lat"], ss.end_point["lng"])
+    fh = ss.flight_height
+    sr = ss.safety_radius
     strategy = ss.bypass_strategy
-    obs      = ss.obstacles
+    obs = ss.obstacles
 
     analysis = {
         "total_distance": 0,
@@ -425,6 +363,7 @@ def plan_route():
         "strategy_used": ""
     }
 
+    # 统计障碍物处理方式
     for o in obs:
         h = o.get("height", 30)
         if h > fh:
@@ -436,70 +375,65 @@ def plan_route():
     rl, rg = get_ref()
     union = build_union(obs, fh, sr, rl, rg)
 
-    # 无障碍物
+    # 无障碍物或union为空
     if union is None or union.is_empty:
         route = [start, end]
-        analysis.update(total_distance=hdist(start, end),
-                        strategy_used="直线（无障碍）", route_points=route)
-        ss.planned_route  = route
+        analysis.update(total_distance=hdist(start, end), strategy_used="直线（无障碍）", route_points=route)
+        ss.planned_route = route
         ss.route_analysis = analysis
         ss.map_key += 1
         return route, analysis
 
     sx, sy = ll2m(start[0], start[1], rl, rg)
-    ex, ey = ll2m(end[0],   end[1],   rl, rg)
+    ex, ey = ll2m(end[0], end[1], rl, rg)
 
     # 直线不碰障碍物
     if not _direct_blocked(sx, sy, ex, ey, union):
         route = [start, end]
-        analysis.update(total_distance=hdist(start, end),
-                        strategy_used="直线（不碰障碍物）", route_points=route)
-        ss.planned_route  = route
+        analysis.update(total_distance=hdist(start, end), strategy_used="直线（不碰障碍物）", route_points=route)
+        ss.planned_route = route
         ss.route_analysis = analysis
         ss.map_key += 1
         return route, analysis
 
-    # 按策略规划
+    # 根据策略规划
     path_m = None
     strat_name = ""
-
     if strategy == "left":
-        path_m     = _plan_side(sx, sy, ex, ey, union, "left")
+        path_m = _plan_side(sx, sy, ex, ey, union, "left")
         strat_name = "左侧绕行"
     elif strategy == "right":
-        path_m     = _plan_side(sx, sy, ex, ey, union, "right")
+        path_m = _plan_side(sx, sy, ex, ey, union, "right")
         strat_name = "右侧绕行"
-    else:  # best：左右各算一遍，取更短的
+    else:  # best
         pm_l = _plan_side(sx, sy, ex, ey, union, "left")
         pm_r = _plan_side(sx, sy, ex, ey, union, "right")
         def ml(pm):
-            return sum(math.hypot(pm[i+1][0]-pm[i][0], pm[i+1][1]-pm[i][1])
-                       for i in range(len(pm)-1)) if pm else float('inf')
+            return sum(math.hypot(pm[i+1][0]-pm[i][0], pm[i+1][1]-pm[i][1]) for i in range(len(pm)-1)) if pm else float('inf')
         ll, lr = ml(pm_l), ml(pm_r)
         if pm_l and ll <= lr:
-            path_m     = pm_l
+            path_m = pm_l
             strat_name = f"最佳（左侧{ll:.0f}m ≤ 右侧{lr:.0f}m）"
         elif pm_r:
-            path_m     = pm_r
+            path_m = pm_r
             strat_name = f"最佳（右侧{lr:.0f}m < 左侧{ll:.0f}m）"
 
-    # 兜底
     if path_m is None:
-        path_m     = _plan_side(sx, sy, ex, ey, union, "both")
+        path_m = _plan_side(sx, sy, ex, ey, union, "both")
         strat_name += "（全向兜底）"
     if path_m is None:
-        path_m     = _fallback(sx, sy, ex, ey, union)
-        strat_name  = "偏移兜底"
+        path_m = _fallback(sx, sy, ex, ey, union)
+        strat_name = "偏移兜底"
 
     route = [m2ll(x, y, rl, rg) for x, y in path_m]
-    nbp   = max(0, len(route) - 2)
+    nbp = max(0, len(route)-2)
     analysis.update(
-        total_distance  = plen(route),
-        bypass_count    = nbp,
-        strategy_used   = f"{strat_name}（{nbp}个绕行点）",
-        route_points    = route
+        total_distance=plen(route),
+        bypass_count=nbp,
+        strategy_used=f"{strat_name}（{nbp}个绕行点）",
+        route_points=route
     )
-    ss.planned_route  = route
+    ss.planned_route = route
     ss.route_analysis = analysis
     ss.map_key += 1
     return route, analysis
@@ -951,20 +885,24 @@ def main():
         with mid:
             ss = st.session_state
             st.subheader("🎮 控制面板")
-            with st.expander("📍 起点 A（GCJ-02）", expanded=True):
-                # 直接绑定到session_state，修改后不自动规划
-                start_lat = st.number_input("纬度", value=ss.start_point["lat"], format="%.6f", key="start_lat")
-                start_lng = st.number_input("经度", value=ss.start_point["lng"], format="%.6f", key="start_lng")
-                if start_lat != ss.start_point["lat"] or start_lng != ss.start_point["lng"]:
-                    ss.start_point = {"lat": start_lat, "lng": start_lng, "height": 0}
-                    # 可选保存
-                    # save_wp()
-            with st.expander("🏁 终点 B（GCJ-02）", expanded=True):
-                end_lat = st.number_input("纬度", value=ss.end_point["lat"], format="%.6f", key="end_lat")
-                end_lng = st.number_input("经度", value=ss.end_point["lng"], format="%.6f", key="end_lng")
-                if end_lat != ss.end_point["lat"] or end_lng != ss.end_point["lng"]:
-                    ss.end_point = {"lat": end_lat, "lng": end_lng, "height": 0}
-                    # save_wp()
+            
+            # ✅ 使用表单一次性修改起点和终点，避免只能改一个的问题
+            with st.form("ab_points_form"):
+                st.markdown("#### 起点 A")
+                temp_start_lat = st.number_input("起点纬度", value=ss.start_point["lat"], format="%.6f")
+                temp_start_lng = st.number_input("起点经度", value=ss.start_point["lng"], format="%.6f")
+                st.markdown("#### 终点 B")
+                temp_end_lat = st.number_input("终点纬度", value=ss.end_point["lat"], format="%.6f")
+                temp_end_lng = st.number_input("终点经度", value=ss.end_point["lng"], format="%.6f")
+                
+                submitted = st.form_submit_button("确认修改 AB 点", use_container_width=True)
+                if submitted:
+                    # 同时更新起点和终点
+                    ss.start_point = {"lat": temp_start_lat, "lng": temp_start_lng, "height": 0}
+                    ss.end_point = {"lat": temp_end_lat, "lng": temp_end_lng, "height": 0}
+                    save_wp()  # 可选保存
+                    st.rerun()
+            
             st.divider()
             st.subheader("✈️ 飞行参数")
             fh = st.number_input("飞行高度 (m)", value=ss.flight_height, step=5, min_value=10, max_value=200)
