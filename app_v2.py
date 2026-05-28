@@ -398,6 +398,104 @@ def _fallback(sx, sy, ex, ey, union):
     return best or [(sx, sy), (ex, ey)]
  
 # ==================== 核心规划函数（手动调用） ====================
+def plan_route():
+    """手动规划航线，更新 session_state"""
+    ss = st.session_state
+    start = (ss.start_point["lat"], ss.start_point["lng"])
+    end   = (ss.end_point["lat"],   ss.end_point["lng"])
+    fh       = ss.flight_height
+    sr       = ss.safety_radius
+    strategy = ss.bypass_strategy
+    obs      = ss.obstacles
+ 
+    analysis = {
+        "total_distance": 0,
+        "obstacles_encountered": [],
+        "bypass_count": 0,
+        "fly_over_count": 0,
+        "route_points": [],
+        "strategy_used": ""
+    }
+ 
+    for o in obs:
+        h = o.get("height", 30)
+        if h > fh:
+            analysis["obstacles_encountered"].append({"height": h, "decision": "绕行"})
+        else:
+            analysis["fly_over_count"] += 1
+            analysis["obstacles_encountered"].append({"height": h, "decision": "飞跃(低)"})
+ 
+    rl, rg = get_ref()
+    union = build_union(obs, fh, sr, rl, rg)
+ 
+    # 无障碍物
+    if union is None or union.is_empty:
+        route = [start, end]
+        analysis.update(total_distance=hdist(start, end),
+                        strategy_used="直线（无障碍）", route_points=route)
+        ss.planned_route  = route
+        ss.route_analysis = analysis
+        ss.map_key += 1
+        return route, analysis
+ 
+    sx, sy = ll2m(start[0], start[1], rl, rg)
+    ex, ey = ll2m(end[0],   end[1],   rl, rg)
+ 
+    # 直线不碰障碍物
+    if not _direct_blocked(sx, sy, ex, ey, union):
+        route = [start, end]
+        analysis.update(total_distance=hdist(start, end),
+                        strategy_used="直线（不碰障碍物）", route_points=route)
+        ss.planned_route  = route
+        ss.route_analysis = analysis
+        ss.map_key += 1
+        return route, analysis
+ 
+    # 按策略规划
+    path_m = None
+    strat_name = ""
+ 
+    if strategy == "left":
+        path_m     = _plan_side(sx, sy, ex, ey, union, "left")
+        strat_name = "左侧绕行"
+    elif strategy == "right":
+        path_m     = _plan_side(sx, sy, ex, ey, union, "right")
+        strat_name = "右侧绕行"
+    else:  # best：左右各算一遍，取更短的
+        pm_l = _plan_side(sx, sy, ex, ey, union, "left")
+        pm_r = _plan_side(sx, sy, ex, ey, union, "right")
+        def ml(pm):
+            return sum(math.hypot(pm[i+1][0]-pm[i][0], pm[i+1][1]-pm[i][1])
+                       for i in range(len(pm)-1)) if pm else float('inf')
+        ll, lr = ml(pm_l), ml(pm_r)
+        if pm_l and ll <= lr:
+            path_m     = pm_l
+            strat_name = f"最佳（左侧{ll:.0f}m ≤ 右侧{lr:.0f}m）"
+        elif pm_r:
+            path_m     = pm_r
+            strat_name = f"最佳（右侧{lr:.0f}m < 左侧{ll:.0f}m）"
+ 
+    # 兜底
+    if path_m is None:
+        path_m     = _plan_side(sx, sy, ex, ey, union, "both")
+        strat_name += "（全向兜底）"
+    if path_m is None:
+        path_m     = _fallback(sx, sy, ex, ey, union)
+        strat_name  = "偏移兜底"
+ 
+    route = [m2ll(x, y, rl, rg) for x, y in path_m]
+    nbp   = max(0, len(route) - 2)
+    analysis.update(
+        total_distance  = plen(route),
+        bypass_count    = nbp,
+        strategy_used   = f"{strat_name}（{nbp}个绕行点）",
+        route_points    = route
+    )
+    ss.planned_route  = route
+    ss.route_analysis = analysis
+    ss.map_key += 1
+    return route, analysis
+ 
 # ==================== 飞行控制（自动飞行，与规划无关） ====================
 def reset_flight():
     ss = st.session_state
