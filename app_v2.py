@@ -1,7 +1,7 @@
 """
-无人机地面站系统 - 手动规划模式
+无人机地面站系统 - 手动规划模式（流畅版）
 - 初始：A(32.2323,118.749), B(32.2344,118.749)
-- 修改AB点不会自动规划，需点击"规划航线"
+- AB点修改需要点击“应用更改”按钮，避免卡顿
 - 绕行算法：Visibility Graph + 面积检测
 """
 
@@ -59,7 +59,7 @@ def init_session_state():
 
 init_session_state()
 
-# ==================== 文件持久化（保存/加载障碍物，可选保存AB点） ====================
+# ==================== 文件持久化（保存/加载障碍物） ====================
 OBSTACLE_FILE = "obstacle_config.json"
 WP_FILE = "waypoints.json"
 
@@ -92,20 +92,6 @@ def save_wp():
             }, f, ensure_ascii=False, indent=2)
     except:
         pass
-
-def load_wp():
-    if os.path.exists(WP_FILE):
-        try:
-            with open(WP_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                st.session_state.start_point = data.get("start_point", DEFAULT_A.copy())
-                st.session_state.end_point = data.get("end_point", DEFAULT_B.copy())
-                st.session_state.flight_height = data.get("flight_height", DEFAULT_FH)
-                st.session_state.safety_radius = data.get("safety_radius", DEFAULT_SR)
-                return True
-        except:
-            pass
-    return False
 
 # ==================== GCJ-02 <-> WGS-84 ====================
 _AE = 6378245.0
@@ -363,7 +349,6 @@ def plan_route():
         "strategy_used": ""
     }
 
-    # 统计障碍物处理方式
     for o in obs:
         h = o.get("height", 30)
         if h > fh:
@@ -375,7 +360,6 @@ def plan_route():
     rl, rg = get_ref()
     union = build_union(obs, fh, sr, rl, rg)
 
-    # 无障碍物或union为空
     if union is None or union.is_empty:
         route = [start, end]
         analysis.update(total_distance=hdist(start, end), strategy_used="直线（无障碍）", route_points=route)
@@ -387,7 +371,6 @@ def plan_route():
     sx, sy = ll2m(start[0], start[1], rl, rg)
     ex, ey = ll2m(end[0], end[1], rl, rg)
 
-    # 直线不碰障碍物
     if not _direct_blocked(sx, sy, ex, ey, union):
         route = [start, end]
         analysis.update(total_distance=hdist(start, end), strategy_used="直线（不碰障碍物）", route_points=route)
@@ -396,7 +379,6 @@ def plan_route():
         ss.map_key += 1
         return route, analysis
 
-    # 根据策略规划
     path_m = None
     strat_name = ""
     if strategy == "left":
@@ -405,7 +387,7 @@ def plan_route():
     elif strategy == "right":
         path_m = _plan_side(sx, sy, ex, ey, union, "right")
         strat_name = "右侧绕行"
-    else:  # best
+    else:
         pm_l = _plan_side(sx, sy, ex, ey, union, "left")
         pm_r = _plan_side(sx, sy, ex, ey, union, "right")
         def ml(pm):
@@ -790,10 +772,7 @@ def main():
     st.title("✈️ 无人机地面站系统")
     st.caption("卫星实况地图 | 智能绕行算法 | 手动规划模式 | 起(32.2323,118.749) 终(32.2344,118.749)")
 
-    # 加载障碍物
     auto_load_obstacles()
-    # 可选：加载之前的AB点（注释掉则始终使用默认值）
-    # load_wp()
 
     hb = heartbeat()
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -861,15 +840,13 @@ def main():
                     cur_mode = ss.setting_mode
                     if ck and "lat" in ck and "lng" in ck and cur_mode in ("start", "end"):
                         gl, gg = wgs2gcj(ck["lat"], ck["lng"])
-                        ss.setting_mode = None   # 清除模式
+                        ss.setting_mode = None
                         if cur_mode == "start":
                             ss.start_point = {"lat": gl, "lng": gg, "height": 0}
                             add_log("GCS→OBC→FCU", f"SET_START ({gl:.5f},{gg:.5f})")
                         else:
                             ss.end_point = {"lat": gl, "lng": gg, "height": 0}
                             add_log("GCS→OBC→FCU", f"SET_END ({gl:.5f},{gg:.5f})")
-                        # 可选：保存AB点
-                        # save_wp()
                         st.rerun()
 
                 # 添加障碍物
@@ -885,33 +862,47 @@ def main():
         with mid:
             ss = st.session_state
             st.subheader("🎮 控制面板")
-            with st.expander("📍 起点 A（GCJ-02）", expanded=True):
-                # 直接绑定到session_state，修改后不自动规划
-                start_lat = st.number_input("纬度", value=ss.start_point["lat"], format="%.6f", key="start_lat")
-                start_lng = st.number_input("经度", value=ss.start_point["lng"], format="%.6f", key="start_lng")
-                if start_lat != ss.start_point["lat"] or start_lng != ss.start_point["lng"]:
-                    ss.start_point = {"lat": start_lat, "lng": start_lng, "height": 0}
-                    # 可选保存
-                    # save_wp()
-            with st.expander("🏁 终点 B（GCJ-02）", expanded=True):
-                end_lat = st.number_input("纬度", value=ss.end_point["lat"], format="%.6f", key="end_lat")
-                end_lng = st.number_input("经度", value=ss.end_point["lng"], format="%.6f", key="end_lng")
-                if end_lat != ss.end_point["lat"] or end_lng != ss.end_point["lng"]:
-                    ss.end_point = {"lat": end_lat, "lng": end_lng, "height": 0}
-                    # save_wp()
-            st.divider()
-            st.subheader("✈️ 飞行参数")
-            fh = st.number_input("飞行高度 (m)", value=ss.flight_height, step=5, min_value=10, max_value=200)
-            if fh != ss.flight_height:
-                ss.flight_height = fh
-                # save_wp()
-            sr = st.number_input("安全半径 (m)", value=ss.safety_radius, step=1, min_value=5, max_value=50)
-            if sr != ss.safety_radius:
-                ss.safety_radius = sr
-                # save_wp()
+            
+            # 使用表单避免频繁rerun
+            with st.form("params_form"):
+                st.markdown("#### 起点/终点")
+                # 起点
+                st.text_input("起点纬度", value=str(ss.start_point["lat"]), key="temp_start_lat")
+                st.text_input("起点经度", value=str(ss.start_point["lng"]), key="temp_start_lng")
+                # 终点
+                st.text_input("终点纬度", value=str(ss.end_point["lat"]), key="temp_end_lat")
+                st.text_input("终点经度", value=str(ss.end_point["lng"]), key="temp_end_lng")
+                
+                st.divider()
+                st.markdown("#### 飞行参数")
+                temp_fh = st.number_input("飞行高度 (m)", value=ss.flight_height, step=5, min_value=10, max_value=200)
+                temp_sr = st.number_input("安全半径 (m)", value=ss.safety_radius, step=1, min_value=5, max_value=50)
+                
+                submitted = st.form_submit_button("应用更改", use_container_width=True)
+                if submitted:
+                    # 更新起点
+                    try:
+                        new_start_lat = float(st.session_state.temp_start_lat)
+                        new_start_lng = float(st.session_state.temp_start_lng)
+                        ss.start_point = {"lat": new_start_lat, "lng": new_start_lng, "height": 0}
+                    except:
+                        pass
+                    try:
+                        new_end_lat = float(st.session_state.temp_end_lat)
+                        new_end_lng = float(st.session_state.temp_end_lng)
+                        ss.end_point = {"lat": new_end_lat, "lng": new_end_lng, "height": 0}
+                    except:
+                        pass
+                    ss.flight_height = temp_fh
+                    ss.safety_radius = temp_sr
+                    save_wp()
+                    st.rerun()
+            
+            # 飞行速度单独控制（实时响应）
             spd = st.slider("飞行速度 (m/s)", 1.0, 20.0, value=float(ss.flight_speed), step=0.5)
             if spd != ss.flight_speed:
                 ss.flight_speed = spd
+            
             st.divider()
             st.subheader("⛔ 新障碍物高度")
             st.number_input("高度 (m)", value=60, step=5, min_value=10, max_value=200, key="new_obstacle_height")
