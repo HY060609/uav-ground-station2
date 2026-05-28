@@ -1,5 +1,5 @@
 """
-无人机地面站系统 - 手动规划模式（流畅版）
+无人机地面站系统 - 手动规划模式（流畅版 + 修复地图索引错误）
 - 初始：A(32.2323,118.749), B(32.2344,118.749)
 - AB点修改需要点击“应用更改”按钮，避免卡顿
 - 绕行算法：Visibility Graph + 面积检测
@@ -29,12 +29,14 @@ def init_session_state():
         return
     st.session_state.inited = True
     st.session_state.heartbeat_count = 0
-    st.session_state.obstacles = []          # 障碍物列表
+    # 加载障碍物时进行过滤，确保 points 有效
+    raw_obs = _obs_load_raw()
+    st.session_state.obstacles = [o for o in raw_obs if o.get("points") and len(o["points"]) >= 3]
     st.session_state.start_point = DEFAULT_A.copy()
     st.session_state.end_point = DEFAULT_B.copy()
     st.session_state.flight_height = DEFAULT_FH
     st.session_state.safety_radius = DEFAULT_SR
-    st.session_state.bypass_strategy = "best"   # left, right, best
+    st.session_state.bypass_strategy = "best"
     st.session_state.planned_route = []
     st.session_state.route_analysis = {}
     st.session_state.setting_mode = None
@@ -55,7 +57,7 @@ def init_session_state():
     st.session_state.link_loss = 0.1
     st.session_state.mission_started = False
     # 持久化文件（可选）
-    st.session_state.obstacles_loaded = False
+    st.session_state.obstacles_loaded = True
 
 init_session_state()
 
@@ -63,17 +65,33 @@ init_session_state()
 OBSTACLE_FILE = "obstacle_config.json"
 WP_FILE = "waypoints.json"
 
+def _obs_load_raw():
+    """从文件读取原始障碍物数据（不过滤）"""
+    if os.path.exists(OBSTACLE_FILE):
+        try:
+            with open(OBSTACLE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("obstacles", [])
+        except:
+            pass
+    return []
+
 def save_obstacles():
+    # 保存前确保每个障碍物 points 有效
+    clean_obs = []
+    for o in st.session_state.obstacles:
+        if o.get("points") and len(o["points"]) >= 3:
+            clean_obs.append(o)
+    st.session_state.obstacles = clean_obs
     with open(OBSTACLE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"obstacles": st.session_state.obstacles}, f, ensure_ascii=False, indent=2)
+        json.dump({"obstacles": clean_obs}, f, ensure_ascii=False, indent=2)
 
 def load_obstacles():
-    if os.path.exists(OBSTACLE_FILE):
-        with open(OBSTACLE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            st.session_state.obstacles = data.get("obstacles", [])
-            return True, len(st.session_state.obstacles)
-    return False, 0
+    raw = _obs_load_raw()
+    # 过滤无效障碍物
+    valid = [o for o in raw if o.get("points") and len(o["points"]) >= 3]
+    st.session_state.obstacles = valid
+    return True, len(valid)
 
 def auto_load_obstacles():
     if not st.session_state.obstacles_loaded:
@@ -81,7 +99,6 @@ def auto_load_obstacles():
         st.session_state.obstacles_loaded = True
 
 def save_wp():
-    """可选：保存起点终点坐标"""
     try:
         with open(WP_FILE, "w", encoding="utf-8") as f:
             json.dump({
@@ -561,75 +578,89 @@ def create_map():
     ).add_to(m)
 
     rl, rg = get_ref()
+    # 遍历障碍物，增加安全检查
     for idx, obs in enumerate(ss.obstacles):
-        pts = obs["points"]
-        wpts = [gcj2wgs(p[0], p[1]) for p in pts]
-        h = obs.get("height", 10)
-        high = h > ss.flight_height
-        fc = "#ff2222" if high else "#ff9900"
-        bc = "#cc0000" if high else "#cc7700"
-        folium.Polygon(
-            locations=wpts, color=bc, weight=2, fill=True, fill_color=fc, fill_opacity=0.55,
-            popup=f"障碍物{idx+1}|{'⛔绕行' if high else '✅飞越'} {h}m",
-            tooltip=f"障碍物{idx+1}|{h}m"
-        ).add_to(m)
-        if high:
-            try:
-                xy = [ll2m(p[0], p[1], rl, rg) for p in wpts]
-                buf = Polygon(xy).buffer(float(ss.safety_radius) + 3.0)
-                if buf.geom_type == 'Polygon':
-                    bp = [m2ll(x, y, rl, rg) for x, y in buf.exterior.coords]
-                    folium.Polygon(
-                        locations=bp, color='#ffff00', weight=1.5, dash_array='5,4',
-                        fill=True, fill_color='#ffff00', fill_opacity=0.08, tooltip="安全缓冲区"
-                    ).add_to(m)
-            except:
-                pass
-        cl = sum(p[0] for p in wpts) / len(wpts)
-        cg = sum(p[1] for p in wpts) / len(wpts)
-        folium.map.Marker(
-            [cl, cg],
-            icon=folium.DivIcon(
-                html=f'<div style="background:rgba(0,0,0,.72);color:#fff;font-size:11px;font-weight:bold;padding:2px 6px;border-radius:4px;border:1px solid {fc};white-space:nowrap;">↑{h}m</div>',
-                icon_size=(58, 22), icon_anchor=(29, 11)
-            )
-        ).add_to(m)
+        pts = obs.get("points", [])
+        if len(pts) < 3:
+            continue   # 跳过无效障碍物
+        try:
+            wpts = [gcj2wgs(p[0], p[1]) for p in pts if len(p) >= 2]
+            if len(wpts) < 3:
+                continue
+            h = obs.get("height", 10)
+            high = h > ss.flight_height
+            fc = "#ff2222" if high else "#ff9900"
+            bc = "#cc0000" if high else "#cc7700"
+            folium.Polygon(
+                locations=wpts, color=bc, weight=2, fill=True, fill_color=fc, fill_opacity=0.55,
+                popup=f"障碍物{idx+1}|{'⛔绕行' if high else '✅飞越'} {h}m",
+                tooltip=f"障碍物{idx+1}|{h}m"
+            ).add_to(m)
+            if high:
+                try:
+                    xy = [ll2m(p[0], p[1], rl, rg) for p in wpts]
+                    buf = Polygon(xy).buffer(float(ss.safety_radius) + 3.0)
+                    if buf.geom_type == 'Polygon':
+                        bp = [m2ll(x, y, rl, rg) for x, y in buf.exterior.coords]
+                        folium.Polygon(
+                            locations=bp, color='#ffff00', weight=1.5, dash_array='5,4',
+                            fill=True, fill_color='#ffff00', fill_opacity=0.08, tooltip="安全缓冲区"
+                        ).add_to(m)
+                except:
+                    pass
+            # 计算中心点用于标注高度
+            cl = sum(p[0] for p in wpts) / len(wpts)
+            cg = sum(p[1] for p in wpts) / len(wpts)
+            folium.map.Marker(
+                [cl, cg],
+                icon=folium.DivIcon(
+                    html=f'<div style="background:rgba(0,0,0,.72);color:#fff;font-size:11px;font-weight:bold;padding:2px 6px;border-radius:4px;border:1px solid {fc};white-space:nowrap;">↑{h}m</div>',
+                    icon_size=(58, 22), icon_anchor=(29, 11)
+                )
+            ).add_to(m)
+        except Exception as e:
+            # 单个障碍物绘制失败，跳过继续
+            continue
 
     route = ss.planned_route
     in_f = ss.auto_flight_enabled or ss.flight_paused or ss.mission_started
     if route:
-        rwgs = [gcj2wgs(p[0], p[1]) for p in route]
-        wpi = ss.current_waypoint_idx
-        if not in_f:
-            folium.PolyLine(rwgs, color='#1e90ff', weight=4, opacity=0.9, dash_array='12,8', tooltip="规划航线（待飞）").add_to(m)
-            for i, pt in enumerate(rwgs):
-                if i == 0 or i == len(rwgs)-1:
-                    continue
-                folium.CircleMarker(pt, radius=6, color='#1e90ff', weight=2,
-                                    fill=True, fill_color='white', fill_opacity=0.9, tooltip=f"航点{i}").add_to(m)
-        else:
-            if wpi >= 1:
-                folium.PolyLine(rwgs[:wpi+1], color='#00dd44', weight=5, opacity=1.0, tooltip="已飞轨迹").add_to(m)
-                for i in range(1, wpi):
-                    folium.CircleMarker(rwgs[i], radius=5, color='#00aa33', weight=2,
-                                        fill=True, fill_color='#00ff55', fill_opacity=1.0).add_to(m)
-            if wpi < len(rwgs)-1:
-                folium.PolyLine(rwgs[wpi:], color='#1e90ff', weight=3, opacity=0.75,
-                                dash_array='10,7', tooltip="待飞航线").add_to(m)
-                for i in range(wpi+1, len(rwgs)-1):
-                    folium.CircleMarker(rwgs[i], radius=5, color='#1e90ff', weight=2,
-                                        fill=True, fill_color='white', fill_opacity=0.85).add_to(m)
-            if ss.flight_drone_pos:
-                dw = gcj2wgs(ss.flight_drone_pos[0], ss.flight_drone_pos[1])
-                folium.CircleMarker(dw, radius=22, color='#ff8c00', weight=1,
-                                    fill=True, fill_color='#ff8c00', fill_opacity=0.18).add_to(m)
-                folium.Marker(
-                    dw, tooltip="🚁 无人机当前位置",
-                    icon=folium.DivIcon(
-                        html='<div style="width:32px;height:32px;background:#ff6600;border:3px solid white;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;box-shadow:0 0 8px rgba(255,102,0,.7);">✈</div>',
-                        icon_size=(32, 32), icon_anchor=(16, 16)
-                    )
-                ).add_to(m)
+        try:
+            rwgs = [gcj2wgs(p[0], p[1]) for p in route]
+            wpi = ss.current_waypoint_idx
+            if not in_f:
+                folium.PolyLine(rwgs, color='#1e90ff', weight=4, opacity=0.9, dash_array='12,8', tooltip="规划航线（待飞）").add_to(m)
+                for i, pt in enumerate(rwgs):
+                    if i == 0 or i == len(rwgs)-1:
+                        continue
+                    folium.CircleMarker(pt, radius=6, color='#1e90ff', weight=2,
+                                        fill=True, fill_color='white', fill_opacity=0.9, tooltip=f"航点{i}").add_to(m)
+            else:
+                if wpi >= 1:
+                    folium.PolyLine(rwgs[:wpi+1], color='#00dd44', weight=5, opacity=1.0, tooltip="已飞轨迹").add_to(m)
+                    for i in range(1, wpi):
+                        folium.CircleMarker(rwgs[i], radius=5, color='#00aa33', weight=2,
+                                            fill=True, fill_color='#00ff55', fill_opacity=1.0).add_to(m)
+                if wpi < len(rwgs)-1:
+                    folium.PolyLine(rwgs[wpi:], color='#1e90ff', weight=3, opacity=0.75,
+                                    dash_array='10,7', tooltip="待飞航线").add_to(m)
+                    for i in range(wpi+1, len(rwgs)-1):
+                        folium.CircleMarker(rwgs[i], radius=5, color='#1e90ff', weight=2,
+                                            fill=True, fill_color='white', fill_opacity=0.85).add_to(m)
+                if ss.flight_drone_pos:
+                    dw = gcj2wgs(ss.flight_drone_pos[0], ss.flight_drone_pos[1])
+                    folium.CircleMarker(dw, radius=22, color='#ff8c00', weight=1,
+                                        fill=True, fill_color='#ff8c00', fill_opacity=0.18).add_to(m)
+                    folium.Marker(
+                        dw, tooltip="🚁 无人机当前位置",
+                        icon=folium.DivIcon(
+                            html='<div style="width:32px;height:32px;background:#ff6600;border:3px solid white;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;box-shadow:0 0 8px rgba(255,102,0,.7);">✈</div>',
+                            icon_size=(32, 32), icon_anchor=(16, 16)
+                        )
+                    ).add_to(m)
+        except Exception as e:
+            # 航线绘制失败，忽略
+            pass
     return m
 
 # ==================== 通信日志 ====================
@@ -858,6 +889,9 @@ def main():
                             st.rerun()
             except Exception as e:
                 st.error(f"地图错误: {e}")
+                # 可选：打印详细堆栈
+                # import traceback
+                # st.code(traceback.format_exc())
 
         with mid:
             ss = st.session_state
