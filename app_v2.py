@@ -856,11 +856,7 @@ def main():
     st.title("✈️ 无人机地面站系统")
     st.caption("卫星实况地图 | 智能绕行算法 | 手动规划模式 | 起(32.2323,118.749) 终(32.2344,118.749)")
  
-    # 加载障碍物
     auto_load_obstacles()
-    # 可选：加载之前的AB点（注释掉则始终使用默认值）
-    # load_wp()
- 
     hb = heartbeat()
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1: st.metric("💓 心跳", "在线")
@@ -876,17 +872,21 @@ def main():
  
     with tab1:
         left, mid, right = st.columns([2, 1, 1])
+        ss = st.session_state
  
         with left:
-            ss = st.session_state
             st.subheader("🛰️ 实时飞行地图（卫星）")
+ 
+            # ---- 按钮行 ----
             mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
             with mc1:
                 if st.button("📍 起点A", use_container_width=True):
                     ss.setting_mode = "start"
+                    ss.map_key += 1   # 刷新地图清除残留 last_clicked
             with mc2:
                 if st.button("🏁 终点B", use_container_width=True):
                     ss.setting_mode = "end"
+                    ss.map_key += 1
             with mc3:
                 if st.button("❌ 取消", use_container_width=True):
                     ss.setting_mode = None
@@ -900,45 +900,61 @@ def main():
                 if st.button("🌟 最佳航线", type="primary", use_container_width=True):
                     ss.bypass_strategy = "best"
  
+            # ---- 状态提示 + 规划按钮 ----
             mode = ss.setting_mode
             if mode == "start":
-                st.info("🔵 点击地图设置起点A")
+                st.info("🔵 点击地图任意位置设置起点A，设置完成后自动退出")
             elif mode == "end":
-                st.info("🔴 点击地图设置终点B")
+                st.info("🔴 点击地图任意位置设置终点B，设置完成后自动退出")
             else:
-                st.caption("当前策略：" + ("左绕行" if ss.bypass_strategy=="left" else "右绕行" if ss.bypass_strategy=="right" else "最佳"))
+                strat_label = {"left":"⬅️ 左绕行","right":"➡️ 右绕行","best":"🌟 最佳"}.get(ss.bypass_strategy,"最佳")
+                st.caption(f"当前策略：{strat_label} | A({ss.start_point['lat']:.4f},{ss.start_point['lng']:.4f}) → B({ss.end_point['lat']:.4f},{ss.end_point['lng']:.4f})")
                 if st.button("✈️ 规划航线", type="primary", use_container_width=True):
                     with st.spinner("正在规划航线..."):
                         plan_route()
-                        add_log("业务流程", f"手动规划航线 | 航点数:{len(ss.planned_route)} | 距离:{ss.route_analysis.get('total_distance',0):.1f}m")
-                    st.success("航线规划完成！")
+                        add_log("业务流程", f"手动规划航线|航点:{len(ss.planned_route)}|距离:{ss.route_analysis.get('total_distance',0):.1f}m")
+                    st.success("✅ 航线规划完成！")
                     st.rerun()
  
-            # 地图绘制
+            # ---- 地图 ----
             try:
                 mp = create_map()
-                out = st_folium(mp, width=820, height=560,
-                                key=f"map_{ss.map_key}",
-                                returned_objects=["last_active_drawing", "last_clicked"])
+                out = st_folium(
+                    mp,
+                    width=820, height=560,
+                    key=f"map_{ss.map_key}",
+                    returned_objects=["last_active_drawing", "last_clicked"]
+                )
  
-                # 处理地图点击设置 A/B 点
+                # ---- AB点点击处理（核心修复）----
+                # 原理：
+                # 1. 每次点"起点A"/"终点B"按钮时，map_key+1 → st_folium 生成新实例
+                #    → last_clicked 从 None 开始，不会残留上一次的点击
+                # 2. 读完 cur_mode 后立即置 None，然后更新坐标，最后 rerun
+                #    → rerun 后 setting_mode=None，不会再次触发
+                # 3. 更新坐标时同步更新 number_input 的 widget key 对应的 session 值
+                #    → 避免 number_input 用旧 value= 覆盖 session_state
                 if out and out.get("last_clicked"):
                     ck = out["last_clicked"]
-                    cur_mode = ss.setting_mode
+                    cur_mode = ss.setting_mode          # ① 先读
                     if ck and "lat" in ck and "lng" in ck and cur_mode in ("start", "end"):
                         gl, gg = wgs2gcj(ck["lat"], ck["lng"])
-                        ss.setting_mode = None   # 清除模式
+                        ss.setting_mode = None          # ② 立即清除，rerun 后不再触发
                         if cur_mode == "start":
                             ss.start_point = {"lat": gl, "lng": gg, "height": 0}
+                            # 同步 number_input widget state，防止 widget 用旧值覆盖
+                            st.session_state["_sa_lat"] = gl
+                            st.session_state["_sa_lng"] = gg
                             add_log("GCS→OBC→FCU", f"SET_START ({gl:.5f},{gg:.5f})")
                         else:
                             ss.end_point = {"lat": gl, "lng": gg, "height": 0}
+                            st.session_state["_sb_lat"] = gl
+                            st.session_state["_sb_lng"] = gg
                             add_log("GCS→OBC→FCU", f"SET_END ({gl:.5f},{gg:.5f})")
-                        # 可选：保存AB点
-                        # save_wp()
+                        save_wp()
                         st.rerun()
  
-                # 添加障碍物
+                # ---- 添加障碍物 ----
                 if out and out.get("last_active_drawing"):
                     feat = out["last_active_drawing"]
                     if feat.get("geometry", {}).get("type") == "Polygon":
@@ -947,34 +963,45 @@ def main():
                             st.rerun()
             except Exception as e:
                 st.error(f"地图错误: {e}")
+                import traceback; st.code(traceback.format_exc())
  
+        # ---- 中栏：控制面板 ----
         with mid:
-            ss = st.session_state
             st.subheader("🎮 控制面板")
+ 
             with st.expander("📍 起点 A（GCJ-02）", expanded=True):
-                # 直接绑定到session_state，修改后不自动规划
-                start_lat = st.number_input("纬度", value=ss.start_point["lat"], format="%.6f", key="start_lat")
-                start_lng = st.number_input("经度", value=ss.start_point["lng"], format="%.6f", key="start_lng")
-                if start_lat != ss.start_point["lat"] or start_lng != ss.start_point["lng"]:
-                    ss.start_point = {"lat": start_lat, "lng": start_lng, "height": 0}
-                    # 可选保存
-                    # save_wp()
+                # 用 _sa_lat/_sa_lng 作为 widget key，与 session_state 解耦
+                # 初始化 widget state（只在首次或被地图点击更新后）
+                if "_sa_lat" not in st.session_state:
+                    st.session_state["_sa_lat"] = ss.start_point["lat"]
+                if "_sa_lng" not in st.session_state:
+                    st.session_state["_sa_lng"] = ss.start_point["lng"]
+                sa_lat = st.number_input("纬度", format="%.6f", key="_sa_lat", step=0.000001)
+                sa_lng = st.number_input("经度", format="%.6f", key="_sa_lng", step=0.000001)
+                # 只有当值真正变化时才更新（避免浮点误差反复触发）
+                if abs(sa_lat - ss.start_point["lat"]) > 1e-7 or abs(sa_lng - ss.start_point["lng"]) > 1e-7:
+                    ss.start_point = {"lat": sa_lat, "lng": sa_lng, "height": 0}
+                    save_wp()
+ 
             with st.expander("🏁 终点 B（GCJ-02）", expanded=True):
-                end_lat = st.number_input("纬度", value=ss.end_point["lat"], format="%.6f", key="end_lat")
-                end_lng = st.number_input("经度", value=ss.end_point["lng"], format="%.6f", key="end_lng")
-                if end_lat != ss.end_point["lat"] or end_lng != ss.end_point["lng"]:
-                    ss.end_point = {"lat": end_lat, "lng": end_lng, "height": 0}
-                    # save_wp()
+                if "_sb_lat" not in st.session_state:
+                    st.session_state["_sb_lat"] = ss.end_point["lat"]
+                if "_sb_lng" not in st.session_state:
+                    st.session_state["_sb_lng"] = ss.end_point["lng"]
+                sb_lat = st.number_input("纬度", format="%.6f", key="_sb_lat", step=0.000001)
+                sb_lng = st.number_input("经度", format="%.6f", key="_sb_lng", step=0.000001)
+                if abs(sb_lat - ss.end_point["lat"]) > 1e-7 or abs(sb_lng - ss.end_point["lng"]) > 1e-7:
+                    ss.end_point = {"lat": sb_lat, "lng": sb_lng, "height": 0}
+                    save_wp()
+ 
             st.divider()
             st.subheader("✈️ 飞行参数")
             fh = st.number_input("飞行高度 (m)", value=ss.flight_height, step=5, min_value=10, max_value=200)
             if fh != ss.flight_height:
-                ss.flight_height = fh
-                # save_wp()
+                ss.flight_height = fh; save_wp()
             sr = st.number_input("安全半径 (m)", value=ss.safety_radius, step=1, min_value=5, max_value=50)
             if sr != ss.safety_radius:
-                ss.safety_radius = sr
-                # save_wp()
+                ss.safety_radius = sr; save_wp()
             spd = st.slider("飞行速度 (m/s)", 1.0, 20.0, value=float(ss.flight_speed), step=0.5)
             if spd != ss.flight_speed:
                 ss.flight_speed = spd
@@ -983,8 +1010,8 @@ def main():
             st.number_input("高度 (m)", value=60, step=5, min_value=10, max_value=200, key="new_obstacle_height")
             st.caption("💡 在地图上用多边形工具绘制")
  
+        # ---- 右栏：分析 + 障碍物 ----
         with right:
-            ss = st.session_state
             st.subheader("📊 航线分析")
             if ss.route_analysis:
                 a = ss.route_analysis
@@ -1003,13 +1030,13 @@ def main():
             if ss.obstacles:
                 st.caption(f"共 {len(ss.obstacles)} 个")
                 for idx, obs in enumerate(ss.obstacles):
-                    col1, col2, col3 = st.columns([1,2,1])
+                    col1, col2, col3 = st.columns([1, 2, 1])
                     with col1:
                         if st.button("🗑️", key=f"d{idx}"):
-                            remove_obstacle(idx)
-                            st.rerun()
+                            remove_obstacle(idx); st.rerun()
                     with col2:
                         st.text(f"障碍 {idx+1}")
+                        if obs.get("created_at"): st.caption(obs["created_at"][:10])
                     with col3:
                         h_ = obs.get('height', 10)
                         st.text(f"{'🔴' if h_ > ss.flight_height else '🟠'} {h_}m")
@@ -1018,21 +1045,28 @@ def main():
             st.divider()
             col_s, col_l, col_c = st.columns(3)
             with col_s:
-                if st.button("💾 保存障碍物", use_container_width=True):
-                    save_obstacles()
-                    st.success("已保存")
+                if st.button("💾 保存", use_container_width=True):
+                    save_obstacles(); save_wp(); st.success("已保存")
             with col_l:
-                if st.button("📂 加载障碍物", use_container_width=True):
-                    load_obstacles()
-                    st.success(f"已加载 {len(ss.obstacles)} 个障碍物")
-                    st.rerun()
+                if st.button("📂 加载", use_container_width=True):
+                    ok, cnt = load_obstacles()
+                    load_wp()
+                    # 同步 number_input widget state
+                    st.session_state["_sa_lat"] = ss.start_point["lat"]
+                    st.session_state["_sa_lng"] = ss.start_point["lng"]
+                    st.session_state["_sb_lat"] = ss.end_point["lat"]
+                    st.session_state["_sb_lng"] = ss.end_point["lng"]
+                    st.success(f"已加载 {cnt} 个障碍物及起终点"); st.rerun()
             with col_c:
-                if st.button("🗑️ 清空障碍物", use_container_width=True):
-                    clear_obstacles()
-                    st.rerun()
+                if st.button("🗑️ 清空", use_container_width=True):
+                    clear_obstacles(); st.rerun()
  
     with tab2:
         render_comm_logs_page()
  
 if __name__ == "__main__":
     main()
+
+
+
+
