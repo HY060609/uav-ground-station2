@@ -616,11 +616,20 @@ def create_map():
     m = folium.Map(
         location=[clat, clng],
         zoom_start=18,
-        tiles='OpenStreetMap',
-        attr='© OpenStreetMap contributors',
+        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        attr='Esri World Imagery | © OpenStreetMap contributors',
         control_scale=True,
         prefer_canvas=True
     )
+    # OpenStreetMap 标注叠加层（道路名、建筑名等文字）
+    folium.TileLayer(
+        tiles='https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+        attr='© OpenStreetMap contributors',
+        name='OSM Label',
+        overlay=True,
+        control=False,
+        opacity=0.5
+    ).add_to(m)
     plugins.Draw(
         draw_options={
             'polygon': {'allowIntersection': False, 'showArea': True, 'shapeOptions': {'color': '#ff3333', 'fillOpacity': 0.35}},
@@ -1066,4 +1075,3 @@ def main():
  
 if __name__ == "__main__":
     main()
-
