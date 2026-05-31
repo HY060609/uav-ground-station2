@@ -616,8 +616,8 @@ def create_map():
     m = folium.Map(
         location=[clat, clng],
         zoom_start=18,
-        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        attr='Esri World Imagery',
+        tiles='OpenStreetMap',
+        attr='© OpenStreetMap contributors',
         control_scale=True,
         prefer_canvas=True
     )
@@ -1066,7 +1066,4 @@ def main():
  
 if __name__ == "__main__":
     main()
-
-
-
 
